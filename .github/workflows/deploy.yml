@@ -1,0 +1,38 @@
+name: Deploy Posts API to Azure Functions
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Azure Functions Core Tools
+        run: |
+          npm install -g azure-functions-core-tools@4 --unsafe-perm true
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          auth-type: SERVICE_PRINCIPAL
+
+      - name: Clear WEBSITE_RUN_FROM_PACKAGE
+        run: |
+          az functionapp config appsettings delete \
+            --name ${{ secrets.POSTS_API_APP_NAME }} \
+            --resource-group my-website-prod-rg \
+            --setting-names WEBSITE_RUN_FROM_PACKAGE WEBSITE_CONTENTAZUREFILECONNECTIONSTRING WEBSITE_CONTENTSHARE
+
+      - name: Deploy to Azure Functions
+        run: |
+          func azure functionapp publish ${{ secrets.POSTS_API_APP_NAME }} --python

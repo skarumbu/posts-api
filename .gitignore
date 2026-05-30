@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+local.settings.json
+.azurite/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.env
+*.log
