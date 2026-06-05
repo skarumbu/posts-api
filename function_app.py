@@ -85,6 +85,110 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "storage error"}, status_code=500)
 
 
+@app.route(route="posts/{slug}", methods=["PUT"])
+def update_post(req: func.HttpRequest) -> func.HttpResponse:
+    """Update an existing post (API-04). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth).
+    Preserves original creation date — does not reset to now() on update.
+    """
+    # 1. Auth gate — must be first (T-04-05)
+    try:
+        require_auth(req)
+    except ValueError:
+        return _unauthorized()
+
+    # 2. Slug validation — checked before any storage access (T-04-08)
+    slug = req.route_params.get("slug")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+
+    # 3. Parse JSON body
+    try:
+        body = req.get_json()
+    except Exception:
+        return _json_response({"error": "Invalid JSON body"}, status_code=400)
+
+    # 4. Read existing blob — serves as 404 check AND preserves original date (T-04-09, Pitfall 3)
+    try:
+        client = get_container_client()
+        blob_client = client.get_blob_client(f"{slug}.md")
+        raw = blob_client.download_blob().readall().decode("utf-8")
+        existing = parse_post(raw)
+        original_date = existing.metadata.get("date")
+    except ResourceNotFoundError:
+        return _json_response({"error": "not found"}, status_code=404)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+    # 5. Extract and validate fields
+    title = (body.get("title") or "").strip()
+    description = (body.get("description") or "").strip()
+    post_body = body.get("body", "")
+    published = bool(body.get("published", False))
+    if not title or not description:
+        return _json_response({"error": "title and description are required"}, status_code=400)
+
+    # 6. Build, validate, serialize, upload
+    try:
+        post = build_post(
+            title=title,
+            slug=slug,
+            date=original_date,   # preserve original creation date
+            description=description,
+            body=post_body,
+            published=published,
+            # updated_at omitted → build_post auto-sets to now()
+        )
+        errors = validate_post(post)
+        if errors:
+            return _json_response({"error": errors[0]}, status_code=400)
+        content = serialize_post(post)
+        blob_client.upload_blob(content.encode(), overwrite=True)
+        date_val = post.metadata.get("date")
+        updated_val = post.metadata.get("updatedAt")
+        return _json_response({
+            "title": post.metadata.get("title"),
+            "slug": post.metadata.get("slug"),
+            "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
+            "description": post.metadata.get("description"),
+            "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
+            "published": post.metadata.get("published"),
+        }, status_code=200)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="posts/{slug}", methods=["DELETE"])
+def delete_post(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete a post by slug (API-05). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth).
+    Returns 204 No Content on success — bare HttpResponse, not _json_response().
+    """
+    # 1. Auth gate — must be first (T-04-06)
+    try:
+        require_auth(req)
+    except ValueError:
+        return _unauthorized()
+
+    # 2. Slug validation (T-04-08)
+    slug = req.route_params.get("slug")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+
+    # 3. Delete blob
+    try:
+        client = get_container_client()
+        client.get_blob_client(f"{slug}.md").delete_blob()
+    except ResourceNotFoundError:
+        return _json_response({"error": "not found"}, status_code=404)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+    # 4. Return 204 No Content — NOT _json_response() (would write a body)
+    return func.HttpResponse(
+        status_code=204,
+        headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
+    )
+
+
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response({"status": "ok", "service": "posts-api"})
