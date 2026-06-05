@@ -7,6 +7,10 @@ from azure.core.exceptions import ResourceNotFoundError
 
 from schema import parse_post
 from slugs import get_container_client
+from auth import require_auth
+from schema import build_post, validate_post, serialize_post
+from slugs import generate_slug
+from datetime import datetime, timezone
 
 # ANONYMOUS is intentional: read routes (Phase 2/3) are public.
 # Write routes (Phase 4) must validate the Bearer token in the handler before mutating any data.
@@ -23,6 +27,62 @@ def _json_response(data: dict, status_code: int = 200) -> func.HttpResponse:
         mimetype="application/json",
         headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
     )
+
+
+def _unauthorized(message: str = "Unauthorized") -> func.HttpResponse:
+    return func.HttpResponse(
+        json.dumps({"error": message}),
+        status_code=401,
+        mimetype="application/json",
+        headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
+    )
+
+
+@app.route(route="posts", methods=["POST"])
+def create_post(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a new post (API-03). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth)."""
+    # 1. Auth gate — must be first; no body parsing before auth check
+    try:
+        require_auth(req)
+    except ValueError:
+        return _unauthorized()
+
+    # 2. Parse JSON body
+    try:
+        body = req.get_json()
+    except Exception:
+        return _json_response({"error": "Invalid JSON body"}, status_code=400)
+
+    # 3. Extract fields
+    title = (body.get("title") or "").strip()
+    description = (body.get("description") or "").strip()
+    post_body = (body.get("body") or "").strip()
+    published = bool(body.get("published", False))
+
+    # 4. Validate required fields
+    if not title or not description:
+        return _json_response({"error": "title and description are required"}, status_code=400)
+
+    # 5. Generate slug, build post, validate, serialize, upload
+    try:
+        client = get_container_client()
+        slug = generate_slug(title, client)
+        post = build_post(
+            title=title,
+            slug=slug,
+            date=datetime.now(timezone.utc).isoformat(),
+            description=description,
+            body=post_body,
+            published=published,
+        )
+        errors = validate_post(post)
+        if errors:
+            return _json_response({"error": errors[0]}, status_code=400)
+        content = serialize_post(post)
+        client.get_blob_client(f"{slug}.md").upload_blob(content.encode(), overwrite=True)
+        return _json_response({"slug": slug}, status_code=201)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
 
 
 @app.route(route="health", methods=["GET"])
