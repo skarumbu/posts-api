@@ -226,3 +226,153 @@ def test_get_post_draft_returns_404(monkeypatch, container_client):
     assert resp.status_code == 404
     body = json.loads(resp.get_body())
     assert body == {"error": "not found"}
+
+
+# ---------------------------------------------------------------------------
+# Write handler tests (Phase 4: API-03, API-04, API-05, SEC-02)
+# ---------------------------------------------------------------------------
+
+import base64
+import json as _json
+
+
+def _make_auth_header(email: str = "test@example.com") -> dict:
+    """Build an X-MS-CLIENT-PRINCIPAL header for testing Easy Auth."""
+    claims = [
+        {"typ": "preferred_username", "val": email},
+        {"typ": "http://schemas.microsoft.com/identity/claims/objectidentifier", "val": "test-oid-123"},
+        {"typ": "name", "val": "Test User"},
+    ]
+    principal = {"claims": claims}
+    encoded = base64.b64encode(_json.dumps(principal).encode()).decode()
+    return {"X-MS-CLIENT-PRINCIPAL": encoded}
+
+
+def test_create_post_requires_auth(monkeypatch):
+    """POST /api/posts without X-MS-CLIENT-PRINCIPAL returns 401."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=_json.dumps({"title": "Test", "description": "Desc"}).encode(),
+        url="/api/posts",
+        params={},
+        headers={},
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 401
+    assert mock_client.get_blob_client.called is False
+
+
+def test_create_post_missing_title(monkeypatch):
+    """POST /api/posts with auth but no title returns 400."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=_json.dumps({"description": "Desc"}).encode(),
+        url="/api/posts",
+        params={},
+        headers=_make_auth_header(),
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 400
+    body = _json.loads(resp.get_body())
+    assert "title" in body.get("error", "").lower() or "description" in body.get("error", "").lower()
+
+
+def test_create_post_missing_description(monkeypatch):
+    """POST /api/posts with auth but no description returns 400."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=_json.dumps({"title": "Test Title"}).encode(),
+        url="/api/posts",
+        params={},
+        headers=_make_auth_header(),
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 400
+    body = _json.loads(resp.get_body())
+    assert "title" in body.get("error", "").lower() or "description" in body.get("error", "").lower()
+
+
+def test_create_post_invalid_json(monkeypatch):
+    """POST /api/posts with auth but invalid JSON body returns 400."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=b"not-json",
+        url="/api/posts",
+        params={},
+        headers=_make_auth_header(),
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 400
+    body = _json.loads(resp.get_body())
+    assert "json" in body.get("error", "").lower()
+
+
+def test_create_post_success(monkeypatch):
+    """POST /api/posts with valid auth and body returns 201 with slug (unit test)."""
+    mock_client = MagicMock()
+    mock_blob = MagicMock()
+    mock_client.get_blob_client.return_value = mock_blob
+    mock_client.list_blobs.return_value = []
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=_json.dumps({
+            "title": "My Test Post",
+            "description": "A test description",
+            "body": "Post content here",
+            "published": False,
+        }).encode(),
+        url="/api/posts",
+        params={},
+        headers=_make_auth_header(),
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 201
+    body = _json.loads(resp.get_body())
+    assert "slug" in body
+
+
+def test_create_post_integration(monkeypatch, container_client):
+    """POST /api/posts with valid auth and body creates blob in Azurite (integration test)."""
+    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
+
+    req = func.HttpRequest(
+        method="POST",
+        body=_json.dumps({
+            "title": "Integration Test Post",
+            "description": "Integration test description",
+            "body": "Integration post content",
+            "published": False,
+        }).encode(),
+        url="/api/posts",
+        params={},
+        headers=_make_auth_header(),
+    )
+    resp = function_app.create_post(req)
+
+    assert resp.status_code == 201
+    body = _json.loads(resp.get_body())
+    assert "slug" in body
+    slug = body["slug"]
+    # Verify blob was actually created in Azurite
+    blob_client = container_client.get_blob_client(f"{slug}.md")
+    blob_data = blob_client.download_blob().readall()
+    assert len(blob_data) > 0
