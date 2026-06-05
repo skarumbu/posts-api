@@ -376,3 +376,254 @@ def test_create_post_integration(monkeypatch, container_client):
     blob_client = container_client.get_blob_client(f"{slug}.md")
     blob_data = blob_client.download_blob().readall()
     assert len(blob_data) > 0
+
+
+# -- update_post (PUT /api/posts/{slug}) --
+
+def test_update_post_requires_auth(monkeypatch):
+    """PUT /api/posts/{slug} without X-MS-CLIENT-PRINCIPAL returns 401."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="PUT",
+        body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
+        url="/api/posts/test-slug",
+        params={},
+        headers={},
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.update_post(req)
+
+    assert resp.status_code == 401
+    assert mock_client.get_blob_client.called is False
+
+
+def test_update_post_not_found(monkeypatch):
+    """PUT /api/posts/{slug} with auth but missing blob returns 404."""
+    mock_client = MagicMock()
+    mock_blob = MagicMock()
+    mock_blob.download_blob.side_effect = ResourceNotFoundError("not found")
+    mock_client.get_blob_client.return_value = mock_blob
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="PUT",
+        body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.update_post(req)
+
+    assert resp.status_code == 404
+
+
+def test_update_post_preserves_date(monkeypatch, container_client):
+    """PUT /api/posts/{slug} preserves the original creation date — does not reset to now()."""
+    from schema import build_post as _build_post, serialize_post as _serialize_post
+
+    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
+
+    original_date = "2026-01-15T00:00:00+00:00"
+    original_post = _build_post(
+        title="Original Title",
+        slug="test-slug",
+        date=original_date,
+        description="Original description",
+        body="Original body",
+        published=False,
+    )
+    container_client.upload_blob("test-slug.md", _serialize_post(original_post).encode(), overwrite=True)
+
+    req = func.HttpRequest(
+        method="PUT",
+        body=_json.dumps({
+            "title": "Updated Title",
+            "description": "Updated description",
+            "body": "Updated body",
+            "published": False,
+        }).encode(),
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.update_post(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body["date"] == original_date, f"Expected {original_date!r}, got {body['date']!r}"
+
+
+def test_update_post_success(monkeypatch):
+    """PUT /api/posts/{slug} with auth and valid body returns 200 with all required fields (unit test)."""
+    from schema import build_post as _build_post, serialize_post as _serialize_post
+
+    original_date = "2026-01-15T00:00:00+00:00"
+    original_post = _build_post(
+        title="Original",
+        slug="test-slug",
+        date=original_date,
+        description="Original desc",
+        body="Original body",
+        published=False,
+    )
+    raw_content = _serialize_post(original_post).encode()
+
+    mock_blob = MagicMock()
+    mock_blob.download_blob.return_value.readall.return_value = raw_content
+    mock_client = MagicMock()
+    mock_client.get_blob_client.return_value = mock_blob
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="PUT",
+        body=_json.dumps({
+            "title": "Updated Title",
+            "description": "Updated description",
+            "body": "Updated body",
+            "published": True,
+        }).encode(),
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.update_post(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    for field in ("title", "slug", "date", "description", "updatedAt", "published"):
+        assert field in body, f"Missing field: {field}"
+
+
+def test_update_post_integration(monkeypatch, container_client):
+    """PUT /api/posts/{slug} with auth and valid body updates blob in Azurite (integration test)."""
+    from schema import build_post as _build_post, serialize_post as _serialize_post
+
+    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
+
+    original_post = _build_post(
+        title="Original Title",
+        slug="test-slug",
+        date="2026-01-15T00:00:00+00:00",
+        description="Original description",
+        body="Original body",
+        published=False,
+    )
+    container_client.upload_blob("test-slug.md", _serialize_post(original_post).encode(), overwrite=True)
+
+    req = func.HttpRequest(
+        method="PUT",
+        body=_json.dumps({
+            "title": "Updated Title",
+            "description": "Updated description",
+            "body": "Updated body",
+            "published": True,
+        }).encode(),
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.update_post(req)
+
+    assert resp.status_code == 200
+
+
+# -- delete_post (DELETE /api/posts/{slug}) --
+
+def test_delete_post_requires_auth(monkeypatch):
+    """DELETE /api/posts/{slug} without X-MS-CLIENT-PRINCIPAL returns 401."""
+    mock_client = MagicMock()
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="DELETE",
+        body=b"",
+        url="/api/posts/test-slug",
+        params={},
+        headers={},
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.delete_post(req)
+
+    assert resp.status_code == 401
+    assert mock_client.get_blob_client.called is False
+
+
+def test_delete_post_not_found(monkeypatch):
+    """DELETE /api/posts/{slug} with auth but missing blob returns 404."""
+    mock_blob = MagicMock()
+    mock_blob.delete_blob.side_effect = ResourceNotFoundError("not found")
+    mock_client = MagicMock()
+    mock_client.get_blob_client.return_value = mock_blob
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="DELETE",
+        body=b"",
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.delete_post(req)
+
+    assert resp.status_code == 404
+
+
+def test_delete_post_success(monkeypatch):
+    """DELETE /api/posts/{slug} with auth and existing blob returns 204 with empty body (unit test)."""
+    mock_blob = MagicMock()
+    mock_client = MagicMock()
+    mock_client.get_blob_client.return_value = mock_blob
+    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+
+    req = func.HttpRequest(
+        method="DELETE",
+        body=b"",
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.delete_post(req)
+
+    assert resp.status_code == 204
+    assert resp.get_body() == b""
+
+
+def test_delete_post_integration(monkeypatch, container_client):
+    """DELETE /api/posts/{slug} with auth deletes blob from Azurite (integration test)."""
+    from schema import build_post as _build_post, serialize_post as _serialize_post
+
+    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
+
+    post = _build_post(
+        title="Post to Delete",
+        slug="test-slug",
+        date="2026-01-15T00:00:00+00:00",
+        description="Will be deleted",
+        body="Delete me",
+        published=False,
+    )
+    container_client.upload_blob("test-slug.md", _serialize_post(post).encode(), overwrite=True)
+
+    req = func.HttpRequest(
+        method="DELETE",
+        body=b"",
+        url="/api/posts/test-slug",
+        params={},
+        headers=_make_auth_header(),
+        route_params={"slug": "test-slug"},
+    )
+    resp = function_app.delete_post(req)
+
+    assert resp.status_code == 204
+    assert resp.get_body() == b""
+    # Verify blob no longer exists in Azurite
+    blob_client = container_client.get_blob_client("test-slug.md")
+    assert blob_client.exists() is False
