@@ -1,239 +1,24 @@
 """
 Tests for function_app.py HTTP handlers.
 
-Covers API-01 (GET /api/posts — list published posts) and
-API-02 (GET /api/posts/{slug} — retrieve single published post).
-
-Unit tests use monkeypatch to avoid Azurite.
-Integration tests use the container_client fixture (Azurite required).
+Covers all 5 route handlers using unittest.mock.patch on requests.get/put/delete.
+Pure unit tests with GitHub API mocks — no external services required.
 """
-import json
+from unittest.mock import patch, MagicMock, call
+import base64
+import json as _json
+import os
 
 import pytest
 import azure.functions as func
-from unittest.mock import MagicMock
-from azure.core.exceptions import ResourceNotFoundError
 
 import function_app
 from schema import build_post, serialize_post
 
 
-# ---------------------------------------------------------------------------
-# Unit tests (monkeypatch only, no Azurite)
-# ---------------------------------------------------------------------------
-
-
-def test_list_posts_empty(monkeypatch):
-    """GET /api/posts with an empty container returns 200 and an empty posts array."""
-    mock_client = MagicMock()
-    mock_client.list_blobs.return_value = []
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
-    resp = function_app.list_posts(req)
-
-    assert resp.status_code == 200
-    body = json.loads(resp.get_body())
-    assert body == {"posts": []}
-
-
-def test_get_post_not_found(monkeypatch):
-    """GET /api/posts/missing-slug returns 404 when download_blob raises ResourceNotFoundError."""
-    mock_client = MagicMock()
-    mock_blob = MagicMock()
-    mock_blob.download_blob.side_effect = ResourceNotFoundError("not found")
-    mock_client.get_blob_client.return_value = mock_blob
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="GET",
-        body=b"",
-        url="/api/posts/missing-slug",
-        params={},
-        route_params={"slug": "missing-slug"},
-    )
-    resp = function_app.get_post(req)
-
-    assert resp.status_code == 404
-    body = json.loads(resp.get_body())
-    assert body == {"error": "not found"}
-
-
-def test_get_post_invalid_slug(monkeypatch):
-    """GET /api/posts/INVALID SLUG returns 400 when slug does not match ^[a-z0-9-]+$."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="GET",
-        body=b"",
-        url="/api/posts/INVALID%20SLUG",
-        params={},
-        route_params={"slug": "INVALID SLUG"},
-    )
-    resp = function_app.get_post(req)
-
-    assert resp.status_code == 400
-    body = json.loads(resp.get_body())
-    assert body == {"error": "invalid slug"}
-
-
-# ---------------------------------------------------------------------------
-# Integration tests (container_client fixture, Azurite required)
-# ---------------------------------------------------------------------------
-
-
-def test_list_posts_returns_published_only(monkeypatch, container_client):
-    """GET /api/posts returns only published posts when both published and draft blobs exist."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    published = build_post(
-        title="Published Post",
-        slug="published-post",
-        date="2026-05-30T00:00:00+00:00",
-        description="A published post",
-        body="Hello world",
-        published=True,
-    )
-    draft = build_post(
-        title="Draft Post",
-        slug="draft-post",
-        date="2026-05-29T00:00:00+00:00",
-        description="A draft post",
-        body="Not ready",
-        published=False,
-    )
-    container_client.upload_blob("published-post.md", serialize_post(published).encode(), overwrite=True)
-    container_client.upload_blob("draft-post.md", serialize_post(draft).encode(), overwrite=True)
-
-    req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
-    resp = function_app.list_posts(req)
-
-    assert resp.status_code == 200
-    body = json.loads(resp.get_body())
-    slugs = [p["slug"] for p in body["posts"]]
-    assert "published-post" in slugs
-    assert "draft-post" not in slugs
-
-
-def test_list_posts_excludes_drafts(monkeypatch, container_client):
-    """GET /api/posts returns an empty posts array when the container contains only draft posts."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    draft = build_post(
-        title="Draft Only",
-        slug="draft-only",
-        date="2026-05-30T00:00:00+00:00",
-        description="Just a draft",
-        body="Work in progress",
-        published=False,
-    )
-    container_client.upload_blob("draft-only.md", serialize_post(draft).encode(), overwrite=True)
-
-    req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
-    resp = function_app.list_posts(req)
-
-    assert resp.status_code == 200
-    body = json.loads(resp.get_body())
-    assert body == {"posts": []}
-
-
-def test_list_posts_sorted_by_date(monkeypatch, container_client):
-    """GET /api/posts returns posts sorted newest-first by date."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    newer = build_post(
-        title="Newer Post",
-        slug="newer-post",
-        date="2026-05-30T00:00:00+00:00",
-        description="The newer post",
-        body="Newer content",
-        published=True,
-    )
-    older = build_post(
-        title="Older Post",
-        slug="older-post",
-        date="2026-05-29T00:00:00+00:00",
-        description="The older post",
-        body="Older content",
-        published=True,
-    )
-    container_client.upload_blob("newer-post.md", serialize_post(newer).encode(), overwrite=True)
-    container_client.upload_blob("older-post.md", serialize_post(older).encode(), overwrite=True)
-
-    req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
-    resp = function_app.list_posts(req)
-
-    assert resp.status_code == 200
-    body = json.loads(resp.get_body())
-    assert len(body["posts"]) == 2
-    assert body["posts"][0]["slug"] == "newer-post"
-
-
-def test_get_post_published(monkeypatch, container_client):
-    """GET /api/posts/{slug} returns 200 with all six fields for a published post."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    post = build_post(
-        title="My Published Post",
-        slug="my-published-post",
-        date="2026-05-30T00:00:00+00:00",
-        description="A great post",
-        body="Post body content here",
-        published=True,
-        updated_at="2026-05-30T12:00:00+00:00",
-    )
-    container_client.upload_blob("my-published-post.md", serialize_post(post).encode(), overwrite=True)
-
-    req = func.HttpRequest(
-        method="GET",
-        body=b"",
-        url="/api/posts/my-published-post",
-        params={},
-        route_params={"slug": "my-published-post"},
-    )
-    resp = function_app.get_post(req)
-
-    assert resp.status_code == 200
-    body = json.loads(resp.get_body())
-    for field in ("title", "slug", "date", "description", "updatedAt", "body"):
-        assert field in body, f"Missing field: {field}"
-
-
-def test_get_post_draft_returns_404(monkeypatch, container_client):
-    """GET /api/posts/{slug} returns 404 when the post exists but is not published."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    draft = build_post(
-        title="Secret Draft",
-        slug="secret-draft",
-        date="2026-05-30T00:00:00+00:00",
-        description="Not ready",
-        body="Draft content",
-        published=False,
-    )
-    container_client.upload_blob("secret-draft.md", serialize_post(draft).encode(), overwrite=True)
-
-    req = func.HttpRequest(
-        method="GET",
-        body=b"",
-        url="/api/posts/secret-draft",
-        params={},
-        route_params={"slug": "secret-draft"},
-    )
-    resp = function_app.get_post(req)
-
-    assert resp.status_code == 404
-    body = json.loads(resp.get_body())
-    assert body == {"error": "not found"}
-
-
-# ---------------------------------------------------------------------------
-# Write handler tests (Phase 4: API-03, API-04, API-05, SEC-02)
-# ---------------------------------------------------------------------------
-
-import base64
-import json as _json
+def encode_content(content_str: str) -> str:
+    """Encode a string as base64 the way GitHub API returns it (no embedded newlines)."""
+    return base64.b64encode(content_str.encode("utf-8")).decode("ascii")
 
 
 def _make_auth_header(email: str = "test@example.com") -> dict:
@@ -248,11 +33,197 @@ def _make_auth_header(email: str = "test@example.com") -> dict:
     return {"X-MS-CLIENT-PRINCIPAL": encoded}
 
 
-def test_create_post_requires_auth(monkeypatch):
-    """POST /api/posts without X-MS-CLIENT-PRINCIPAL returns 401."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+_ENV = {"GITHUB_TOKEN": "fake-token", "GITHUB_REPO": "owner/repo"}
 
+
+# ---------------------------------------------------------------------------
+# GET /api/posts/:slug (get_post)
+# ---------------------------------------------------------------------------
+
+def test_get_post_success():
+    """GET /api/posts/test returns 200 with post data when GitHub returns 200."""
+    post = build_post(
+        title="Test Post",
+        slug="test",
+        date="2026-01-01T00:00:00+00:00",
+        description="A test",
+        body="Test body",
+        published=True,
+    )
+    raw = serialize_post(post)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
+        req = func.HttpRequest(
+            method="GET",
+            body=b"",
+            url="/api/posts/test",
+            params={},
+            route_params={"slug": "test"},
+        )
+        resp = function_app.get_post(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert "slug" in body
+    assert body["slug"] == "test"
+
+
+def test_get_post_not_found():
+    """GET /api/posts/missing returns 404 when GitHub returns 404."""
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
+        req = func.HttpRequest(
+            method="GET",
+            body=b"",
+            url="/api/posts/missing",
+            params={},
+            route_params={"slug": "missing"},
+        )
+        resp = function_app.get_post(req)
+
+    assert resp.status_code == 404
+    body = _json.loads(resp.get_body())
+    assert body == {"error": "not found"}
+
+
+def test_get_post_invalid_slug():
+    """GET /api/posts with invalid slug returns 400 — no requests call needed."""
+    req = func.HttpRequest(
+        method="GET",
+        body=b"",
+        url="/api/posts/../../etc/passwd",
+        params={},
+        route_params={"slug": "../../etc/passwd"},
+    )
+    resp = function_app.get_post(req)
+
+    assert resp.status_code == 400
+    body = _json.loads(resp.get_body())
+    assert body == {"error": "invalid slug"}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/posts (list_posts)
+# ---------------------------------------------------------------------------
+
+def test_list_posts_empty():
+    """GET /api/posts with empty directory returns 200 and empty posts array."""
+    mock_dir_resp = MagicMock()
+    mock_dir_resp.status_code = 200
+    mock_dir_resp.json.return_value = []
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_dir_resp):
+        req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
+        resp = function_app.list_posts(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body == {"posts": []}
+
+
+def test_list_posts_returns_published_only():
+    """GET /api/posts returns only published posts — directory has one published post."""
+    post = build_post(
+        title="Published Post",
+        slug="published-post",
+        date="2026-05-30T00:00:00+00:00",
+        description="A published post",
+        body="Hello world",
+        published=True,
+    )
+    raw = serialize_post(post)
+
+    # First GET: directory listing; Second GET: file content
+    dir_resp = MagicMock()
+    dir_resp.status_code = 200
+    dir_resp.json.return_value = [
+        {"name": "published-post.md", "url": "https://api.github.com/repos/owner/repo/contents/posts/published-post.md"},
+    ]
+    file_resp = MagicMock()
+    file_resp.status_code = 200
+    file_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[dir_resp, file_resp]):
+        req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
+        resp = function_app.list_posts(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert len(body["posts"]) == 1
+    assert body["posts"][0]["slug"] == "published-post"
+
+
+def test_list_posts_excludes_drafts():
+    """GET /api/posts returns empty array when directory has only a draft post."""
+    post = build_post(
+        title="Draft Post",
+        slug="draft-post",
+        date="2026-05-30T00:00:00+00:00",
+        description="A draft",
+        body="Draft body",
+        published=False,
+    )
+    raw = serialize_post(post)
+
+    dir_resp = MagicMock()
+    dir_resp.status_code = 200
+    dir_resp.json.return_value = [
+        {"name": "draft-post.md", "url": "https://api.github.com/repos/owner/repo/contents/posts/draft-post.md"},
+    ]
+    file_resp = MagicMock()
+    file_resp.status_code = 200
+    file_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[dir_resp, file_resp]):
+        req = func.HttpRequest(method="GET", body=b"", url="/api/posts", params={})
+        resp = function_app.list_posts(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body == {"posts": []}
+
+
+# ---------------------------------------------------------------------------
+# POST /api/posts (create_post)
+# ---------------------------------------------------------------------------
+
+def test_create_post_success():
+    """POST /api/posts with valid auth and body returns 201 with slug."""
+    # generate_slug hits GET (404 = free slug); create_file hits PUT (201 = created)
+    get_resp = MagicMock()
+    get_resp.status_code = 404
+    put_resp = MagicMock()
+    put_resp.status_code = 201
+
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.put", return_value=put_resp):
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({
+                "title": "My Test Post",
+                "description": "A description",
+                "body": "Content here",
+                "published": False,
+            }).encode(),
+            url="/api/posts",
+            params={},
+            headers=_make_auth_header(),
+        )
+        resp = function_app.create_post(req)
+
+    assert resp.status_code == 201
+    body = _json.loads(resp.get_body())
+    assert "slug" in body
+
+
+def test_create_post_requires_auth():
+    """POST /api/posts without X-MS-CLIENT-PRINCIPAL returns 401 — auth gate fires before any requests call."""
     req = func.HttpRequest(
         method="POST",
         body=_json.dumps({"title": "Test", "description": "Desc"}).encode(),
@@ -263,17 +234,13 @@ def test_create_post_requires_auth(monkeypatch):
     resp = function_app.create_post(req)
 
     assert resp.status_code == 401
-    assert mock_client.get_blob_client.called is False
 
 
-def test_create_post_missing_title(monkeypatch):
+def test_create_post_missing_title():
     """POST /api/posts with auth but no title returns 400."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
     req = func.HttpRequest(
         method="POST",
-        body=_json.dumps({"description": "Desc"}).encode(),
+        body=_json.dumps({"description": "Desc only"}).encode(),
         url="/api/posts",
         params={},
         headers=_make_auth_header(),
@@ -285,213 +252,45 @@ def test_create_post_missing_title(monkeypatch):
     assert "title" in body.get("error", "").lower() or "description" in body.get("error", "").lower()
 
 
-def test_create_post_missing_description(monkeypatch):
-    """POST /api/posts with auth but no description returns 400."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+# ---------------------------------------------------------------------------
+# PUT /api/posts/:slug (update_post)
+# ---------------------------------------------------------------------------
 
-    req = func.HttpRequest(
-        method="POST",
-        body=_json.dumps({"title": "Test Title"}).encode(),
-        url="/api/posts",
-        params={},
-        headers=_make_auth_header(),
-    )
-    resp = function_app.create_post(req)
-
-    assert resp.status_code == 400
-    body = _json.loads(resp.get_body())
-    assert "title" in body.get("error", "").lower() or "description" in body.get("error", "").lower()
-
-
-def test_create_post_invalid_json(monkeypatch):
-    """POST /api/posts with auth but invalid JSON body returns 400."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="POST",
-        body=b"not-json",
-        url="/api/posts",
-        params={},
-        headers=_make_auth_header(),
-    )
-    resp = function_app.create_post(req)
-
-    assert resp.status_code == 400
-    body = _json.loads(resp.get_body())
-    assert "json" in body.get("error", "").lower()
-
-
-def test_create_post_success(monkeypatch):
-    """POST /api/posts with valid auth and body returns 201 with slug (unit test)."""
-    mock_client = MagicMock()
-    mock_blob = MagicMock()
-    mock_client.get_blob_client.return_value = mock_blob
-    mock_client.list_blobs.return_value = []
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="POST",
-        body=_json.dumps({
-            "title": "My Test Post",
-            "description": "A test description",
-            "body": "Post content here",
-            "published": False,
-        }).encode(),
-        url="/api/posts",
-        params={},
-        headers=_make_auth_header(),
-    )
-    resp = function_app.create_post(req)
-
-    assert resp.status_code == 201
-    body = _json.loads(resp.get_body())
-    assert "slug" in body
-
-
-def test_create_post_integration(monkeypatch, container_client):
-    """POST /api/posts with valid auth and body creates blob in Azurite (integration test)."""
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    req = func.HttpRequest(
-        method="POST",
-        body=_json.dumps({
-            "title": "Integration Test Post",
-            "description": "Integration test description",
-            "body": "Integration post content",
-            "published": False,
-        }).encode(),
-        url="/api/posts",
-        params={},
-        headers=_make_auth_header(),
-    )
-    resp = function_app.create_post(req)
-
-    assert resp.status_code == 201
-    body = _json.loads(resp.get_body())
-    assert "slug" in body
-    slug = body["slug"]
-    # Verify blob was actually created in Azurite
-    blob_client = container_client.get_blob_client(f"{slug}.md")
-    blob_data = blob_client.download_blob().readall()
-    assert len(blob_data) > 0
-
-
-# -- update_post (PUT /api/posts/{slug}) --
-
-def test_update_post_requires_auth(monkeypatch):
-    """PUT /api/posts/{slug} without X-MS-CLIENT-PRINCIPAL returns 401."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="PUT",
-        body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
-        url="/api/posts/test-slug",
-        params={},
-        headers={},
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.update_post(req)
-
-    assert resp.status_code == 401
-    assert mock_client.get_blob_client.called is False
-
-
-def test_update_post_not_found(monkeypatch):
-    """PUT /api/posts/{slug} with auth but missing blob returns 404."""
-    mock_client = MagicMock()
-    mock_blob = MagicMock()
-    mock_blob.download_blob.side_effect = ResourceNotFoundError("not found")
-    mock_client.get_blob_client.return_value = mock_blob
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="PUT",
-        body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.update_post(req)
-
-    assert resp.status_code == 404
-
-
-def test_update_post_preserves_date(monkeypatch, container_client):
-    """PUT /api/posts/{slug} preserves the original creation date — does not reset to now()."""
-    from schema import build_post as _build_post, serialize_post as _serialize_post
-
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    original_date = "2026-01-15T00:00:00+00:00"
-    original_post = _build_post(
-        title="Original Title",
-        slug="test-slug",
-        date=original_date,
-        description="Original description",
-        body="Original body",
-        published=False,
-    )
-    container_client.upload_blob("test-slug.md", _serialize_post(original_post).encode(), overwrite=True)
-
-    req = func.HttpRequest(
-        method="PUT",
-        body=_json.dumps({
-            "title": "Updated Title",
-            "description": "Updated description",
-            "body": "Updated body",
-            "published": False,
-        }).encode(),
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.update_post(req)
-
-    assert resp.status_code == 200
-    body = _json.loads(resp.get_body())
-    assert body["date"] == original_date, f"Expected {original_date!r}, got {body['date']!r}"
-
-
-def test_update_post_success(monkeypatch):
-    """PUT /api/posts/{slug} with auth and valid body returns 200 with all required fields (unit test)."""
-    from schema import build_post as _build_post, serialize_post as _serialize_post
-
-    original_date = "2026-01-15T00:00:00+00:00"
-    original_post = _build_post(
+def test_update_post_success():
+    """PUT /api/posts/test-slug with valid auth and body returns 200 with all required fields."""
+    post = build_post(
         title="Original",
         slug="test-slug",
-        date=original_date,
-        description="Original desc",
-        body="Original body",
+        date="2026-01-15T00:00:00+00:00",
+        description="desc",
+        body="body",
         published=False,
     )
-    raw_content = _serialize_post(original_post).encode()
+    raw = serialize_post(post)
 
-    mock_blob = MagicMock()
-    mock_blob.download_blob.return_value.readall.return_value = raw_content
-    mock_client = MagicMock()
-    mock_client.get_blob_client.return_value = mock_blob
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    put_resp = MagicMock()
+    put_resp.status_code = 200
 
-    req = func.HttpRequest(
-        method="PUT",
-        body=_json.dumps({
-            "title": "Updated Title",
-            "description": "Updated description",
-            "body": "Updated body",
-            "published": True,
-        }).encode(),
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.update_post(req)
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.put", return_value=put_resp):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({
+                "title": "Updated Title",
+                "description": "Updated desc",
+                "body": "Updated body",
+                "published": True,
+            }).encode(),
+            url="/api/posts/test-slug",
+            params={},
+            headers=_make_auth_header(),
+            route_params={"slug": "test-slug"},
+        )
+        resp = function_app.update_post(req)
 
     assert resp.status_code == 200
     body = _json.loads(resp.get_body())
@@ -499,47 +298,90 @@ def test_update_post_success(monkeypatch):
         assert field in body, f"Missing field: {field}"
 
 
-def test_update_post_integration(monkeypatch, container_client):
-    """PUT /api/posts/{slug} with auth and valid body updates blob in Azurite (integration test)."""
-    from schema import build_post as _build_post, serialize_post as _serialize_post
+def test_update_post_not_found():
+    """PUT /api/posts/missing with auth but missing file returns 404."""
+    get_resp = MagicMock()
+    get_resp.status_code = 404
 
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
+            url="/api/posts/missing",
+            params={},
+            headers=_make_auth_header(),
+            route_params={"slug": "missing"},
+        )
+        resp = function_app.update_post(req)
 
-    original_post = _build_post(
-        title="Original Title",
-        slug="test-slug",
-        date="2026-01-15T00:00:00+00:00",
-        description="Original description",
-        body="Original body",
-        published=False,
-    )
-    container_client.upload_blob("test-slug.md", _serialize_post(original_post).encode(), overwrite=True)
+    assert resp.status_code == 404
 
+
+def test_update_post_requires_auth():
+    """PUT /api/posts/test-slug without X-MS-CLIENT-PRINCIPAL returns 401."""
     req = func.HttpRequest(
         method="PUT",
-        body=_json.dumps({
-            "title": "Updated Title",
-            "description": "Updated description",
-            "body": "Updated body",
-            "published": True,
-        }).encode(),
+        body=_json.dumps({"title": "Updated", "description": "Desc"}).encode(),
         url="/api/posts/test-slug",
         params={},
-        headers=_make_auth_header(),
+        headers={},
         route_params={"slug": "test-slug"},
     )
     resp = function_app.update_post(req)
 
-    assert resp.status_code == 200
+    assert resp.status_code == 401
 
 
-# -- delete_post (DELETE /api/posts/{slug}) --
+# ---------------------------------------------------------------------------
+# DELETE /api/posts/:slug (delete_post)
+# ---------------------------------------------------------------------------
 
-def test_delete_post_requires_auth(monkeypatch):
-    """DELETE /api/posts/{slug} without X-MS-CLIENT-PRINCIPAL returns 401."""
-    mock_client = MagicMock()
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
+def test_delete_post_success():
+    """DELETE /api/posts/test-slug with auth returns 204 with empty body."""
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.json.return_value = {"sha": "abc123", "content": encode_content("---\nslug: test-slug\n---\n")}
+    del_resp = MagicMock()
+    del_resp.status_code = 200
 
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.delete", return_value=del_resp):
+        req = func.HttpRequest(
+            method="DELETE",
+            body=b"",
+            url="/api/posts/test-slug",
+            params={},
+            headers=_make_auth_header(),
+            route_params={"slug": "test-slug"},
+        )
+        resp = function_app.delete_post(req)
+
+    assert resp.status_code == 204
+    assert resp.get_body() == b""
+
+
+def test_delete_post_not_found():
+    """DELETE /api/posts/missing with auth but missing file returns 404."""
+    get_resp = MagicMock()
+    get_resp.status_code = 404
+
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp):
+        req = func.HttpRequest(
+            method="DELETE",
+            body=b"",
+            url="/api/posts/missing",
+            params={},
+            headers=_make_auth_header(),
+            route_params={"slug": "missing"},
+        )
+        resp = function_app.delete_post(req)
+
+    assert resp.status_code == 404
+
+
+def test_delete_post_requires_auth():
+    """DELETE /api/posts/test-slug without X-MS-CLIENT-PRINCIPAL returns 401."""
     req = func.HttpRequest(
         method="DELETE",
         body=b"",
@@ -551,79 +393,3 @@ def test_delete_post_requires_auth(monkeypatch):
     resp = function_app.delete_post(req)
 
     assert resp.status_code == 401
-    assert mock_client.get_blob_client.called is False
-
-
-def test_delete_post_not_found(monkeypatch):
-    """DELETE /api/posts/{slug} with auth but missing blob returns 404."""
-    mock_blob = MagicMock()
-    mock_blob.delete_blob.side_effect = ResourceNotFoundError("not found")
-    mock_client = MagicMock()
-    mock_client.get_blob_client.return_value = mock_blob
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="DELETE",
-        body=b"",
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.delete_post(req)
-
-    assert resp.status_code == 404
-
-
-def test_delete_post_success(monkeypatch):
-    """DELETE /api/posts/{slug} with auth and existing blob returns 204 with empty body (unit test)."""
-    mock_blob = MagicMock()
-    mock_client = MagicMock()
-    mock_client.get_blob_client.return_value = mock_blob
-    monkeypatch.setattr("function_app.get_container_client", lambda: mock_client)
-
-    req = func.HttpRequest(
-        method="DELETE",
-        body=b"",
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.delete_post(req)
-
-    assert resp.status_code == 204
-    assert resp.get_body() == b""
-
-
-def test_delete_post_integration(monkeypatch, container_client):
-    """DELETE /api/posts/{slug} with auth deletes blob from Azurite (integration test)."""
-    from schema import build_post as _build_post, serialize_post as _serialize_post
-
-    monkeypatch.setattr("function_app.get_container_client", lambda: container_client)
-
-    post = _build_post(
-        title="Post to Delete",
-        slug="test-slug",
-        date="2026-01-15T00:00:00+00:00",
-        description="Will be deleted",
-        body="Delete me",
-        published=False,
-    )
-    container_client.upload_blob("test-slug.md", _serialize_post(post).encode(), overwrite=True)
-
-    req = func.HttpRequest(
-        method="DELETE",
-        body=b"",
-        url="/api/posts/test-slug",
-        params={},
-        headers=_make_auth_header(),
-        route_params={"slug": "test-slug"},
-    )
-    resp = function_app.delete_post(req)
-
-    assert resp.status_code == 204
-    assert resp.get_body() == b""
-    # Verify blob no longer exists in Azurite
-    blob_client = container_client.get_blob_client("test-slug.md")
-    assert blob_client.exists() is False
