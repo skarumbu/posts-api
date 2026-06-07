@@ -4,9 +4,31 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
   deploy:
+    if: github.event_name == 'push'
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,8 +39,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Azure Functions Core Tools
-        run: |
-          npm install -g azure-functions-core-tools@4 --unsafe-perm true
+        run: npm install -g azure-functions-core-tools@4 --unsafe-perm true
 
       - name: Log in to Azure
         uses: azure/login@v2
@@ -34,5 +55,4 @@ jobs:
             --setting-names WEBSITE_RUN_FROM_PACKAGE WEBSITE_CONTENTAZUREFILECONNECTIONSTRING WEBSITE_CONTENTSHARE
 
       - name: Deploy to Azure Functions
-        run: |
-          func azure functionapp publish ${{ secrets.POSTS_API_APP_NAME }} --python
+        run: func azure functionapp publish ${{ secrets.POSTS_API_APP_NAME }} --python
