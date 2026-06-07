@@ -56,3 +56,14 @@ jobs:
 
       - name: Deploy to Azure Functions
         run: func azure functionapp publish ${{ secrets.POSTS_API_APP_NAME }} --python
+
+  update-arch-content:
+    needs: deploy
+    uses: skarumbu/my-website/.github/workflows/arch-content-update-reusable.yml@main
+    with:
+      repo_name: posts-api
+      commit_sha: ${{ github.sha }}
+      commit_message: ${{ github.event.head_commit.message }}
+    secrets:
+      ARCH_CONTENT_FOUNDRY_KEY: ${{ secrets.ARCH_CONTENT_FOUNDRY_KEY }}
+      ARCH_UPDATE_GH_TOKEN: ${{ secrets.DESIGN_DOC_GH_TOKEN }}
