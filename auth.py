@@ -21,8 +21,10 @@ def require_auth(req: func.HttpRequest) -> tuple[str, str]:
         raise ValueError("Missing or invalid Authorization header")
     token = auth_header[len("Bearer "):]
     try:
-        client_id = os.environ["GOOGLE_CLIENT_ID"]
-        idinfo = id_token.verify_oauth2_token(token, _google_request, client_id)
+        allowed = {c.strip() for c in os.environ["GOOGLE_CLIENT_ID"].split(",") if c.strip()}
+        idinfo = id_token.verify_oauth2_token(token, _google_request, None)
+        if idinfo.get("aud") not in allowed:
+            raise ValueError(f"Unrecognised client: {idinfo.get('aud')}")
         return idinfo["sub"], idinfo["email"]
     except Exception as e:
         logger.warning("Google token verification failed: %s", e)

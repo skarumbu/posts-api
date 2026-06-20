@@ -32,7 +32,7 @@ import time
 import requests
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-SCOPES = ["openid", "email"]
+SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email"]
 _CACHE = os.path.join(os.path.expanduser("~"), ".posts-cli-google-token.json")
 
 
