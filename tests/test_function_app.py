@@ -4,7 +4,7 @@ Tests for function_app.py HTTP handlers.
 Covers all 5 route handlers using unittest.mock.patch on requests.get/put/delete.
 Pure unit tests with GitHub API mocks — no external services required.
 """
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 import base64
 import json as _json
 import os
@@ -21,16 +21,9 @@ def encode_content(content_str: str) -> str:
     return base64.b64encode(content_str.encode("utf-8")).decode("ascii")
 
 
-def _make_auth_header(email: str = "test@example.com") -> dict:
-    """Build an X-MS-CLIENT-PRINCIPAL header for testing Easy Auth."""
-    claims = [
-        {"typ": "preferred_username", "val": email},
-        {"typ": "http://schemas.microsoft.com/identity/claims/objectidentifier", "val": "test-oid-123"},
-        {"typ": "name", "val": "Test User"},
-    ]
-    principal = {"claims": claims}
-    encoded = base64.b64encode(_json.dumps(principal).encode()).decode()
-    return {"X-MS-CLIENT-PRINCIPAL": encoded}
+def _auth_patch(email: str = "test@example.com"):
+    """Patch require_auth to return the given Google identity without touching real JWT logic."""
+    return patch("function_app.require_auth", return_value=("google-sub-123", email))
 
 
 _ENV = {"GITHUB_TOKEN": "fake-token", "GITHUB_REPO": "owner/repo"}
@@ -193,14 +186,14 @@ def test_list_posts_excludes_drafts():
 # ---------------------------------------------------------------------------
 
 def test_create_post_success():
-    """POST /api/posts with valid auth and body returns 201 with slug."""
-    # generate_slug hits GET (404 = free slug); create_file hits PUT (201 = created)
+    """POST /api/posts with valid Google auth returns 201 with slug."""
     get_resp = MagicMock()
     get_resp.status_code = 404
     put_resp = MagicMock()
     put_resp.status_code = 201
 
     with patch.dict(os.environ, _ENV), \
+         _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
          patch("requests.put", return_value=put_resp):
         req = func.HttpRequest(
@@ -213,7 +206,7 @@ def test_create_post_success():
             }).encode(),
             url="/api/posts",
             params={},
-            headers=_make_auth_header(),
+            headers={},
         )
         resp = function_app.create_post(req)
 
@@ -223,7 +216,7 @@ def test_create_post_success():
 
 
 def test_create_post_requires_auth():
-    """POST /api/posts without X-MS-CLIENT-PRINCIPAL returns 401 — auth gate fires before any requests call."""
+    """POST /api/posts without Authorization header returns 401."""
     req = func.HttpRequest(
         method="POST",
         body=_json.dumps({"title": "Test", "description": "Desc"}).encode(),
@@ -236,20 +229,83 @@ def test_create_post_requires_auth():
     assert resp.status_code == 401
 
 
+def test_create_post_forbidden_not_in_allowlist():
+    """POST /api/posts with ALLOWED_WRITERS set and requester not in list returns 403."""
+    with patch.dict(os.environ, {**_ENV, "ALLOWED_WRITERS": "owner@example.com"}), \
+         _auth_patch(email="other@example.com"):
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({"title": "Test", "description": "Desc"}).encode(),
+            url="/api/posts",
+            params={},
+            headers={},
+        )
+        resp = function_app.create_post(req)
+
+    assert resp.status_code == 403
+
+
 def test_create_post_missing_title():
     """POST /api/posts with auth but no title returns 400."""
-    req = func.HttpRequest(
-        method="POST",
-        body=_json.dumps({"description": "Desc only"}).encode(),
-        url="/api/posts",
-        params={},
-        headers=_make_auth_header(),
-    )
-    resp = function_app.create_post(req)
+    with _auth_patch():
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({"description": "Desc only"}).encode(),
+            url="/api/posts",
+            params={},
+            headers={},
+        )
+        resp = function_app.create_post(req)
 
     assert resp.status_code == 400
     body = _json.loads(resp.get_body())
     assert "title" in body.get("error", "").lower() or "description" in body.get("error", "").lower()
+
+
+def test_create_post_stores_author_email():
+    """POST /api/posts stores author_email in the serialized frontmatter."""
+    get_resp = MagicMock()
+    get_resp.status_code = 404
+    put_resp = MagicMock()
+    put_resp.status_code = 201
+
+    captured_body = {}
+
+    def capture_put(url, **kwargs):
+        captured_body.update(_json.loads(kwargs.get("data", b"{}")))
+        return put_resp
+
+    import base64 as _b64
+
+    def capture_put2(url, **kwargs):
+        import requests as _req
+        data = kwargs.get("json") or _json.loads(kwargs.get("data", b"{}"))
+        message = data.get("message", "")
+        content_b64 = data.get("content", "")
+        if content_b64:
+            captured_body["content"] = _b64.b64decode(content_b64).decode()
+        return put_resp
+
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="owner@example.com"), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.put", side_effect=capture_put2):
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({
+                "title": "Authored Post",
+                "description": "A post with an author",
+                "body": "Body text",
+                "published": False,
+            }).encode(),
+            url="/api/posts",
+            params={},
+            headers={},
+        )
+        function_app.create_post(req)
+
+    assert "author_email" in captured_body.get("content", "")
+    assert "owner@example.com" in captured_body.get("content", "")
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +313,7 @@ def test_create_post_missing_title():
 # ---------------------------------------------------------------------------
 
 def test_update_post_success():
-    """PUT /api/posts/test-slug with valid auth and body returns 200 with all required fields."""
+    """PUT /api/posts/test-slug with valid auth returns 200 with all required fields."""
     post = build_post(
         title="Original",
         slug="test-slug",
@@ -265,6 +321,7 @@ def test_update_post_success():
         description="desc",
         body="body",
         published=False,
+        author_email="test@example.com",
     )
     raw = serialize_post(post)
 
@@ -275,6 +332,7 @@ def test_update_post_success():
     put_resp.status_code = 200
 
     with patch.dict(os.environ, _ENV), \
+         _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
          patch("requests.put", return_value=put_resp):
         req = func.HttpRequest(
@@ -287,7 +345,7 @@ def test_update_post_success():
             }).encode(),
             url="/api/posts/test-slug",
             params={},
-            headers=_make_auth_header(),
+            headers={},
             route_params={"slug": "test-slug"},
         )
         resp = function_app.update_post(req)
@@ -298,18 +356,88 @@ def test_update_post_success():
         assert field in body, f"Missing field: {field}"
 
 
+def test_update_post_ownership_mismatch():
+    """PUT /api/posts/test-slug returns 403 when requester is not the author."""
+    post = build_post(
+        title="Original",
+        slug="test-slug",
+        date="2026-01-15T00:00:00+00:00",
+        description="desc",
+        body="body",
+        published=False,
+        author_email="alice@example.com",
+    )
+    raw = serialize_post(post)
+
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="bob@example.com"), \
+         patch("requests.get", return_value=get_resp):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({"title": "Hacked", "description": "Stolen"}).encode(),
+            url="/api/posts/test-slug",
+            params={},
+            headers={},
+            route_params={"slug": "test-slug"},
+        )
+        resp = function_app.update_post(req)
+
+    assert resp.status_code == 403
+
+
+def test_update_post_legacy_no_author_allowed_writer():
+    """PUT on a legacy post (no author_email) succeeds for an ALLOWED_WRITERS member."""
+    post = build_post(
+        title="Legacy",
+        slug="legacy-post",
+        date="2026-01-01T00:00:00+00:00",
+        description="old post",
+        body="old body",
+        published=True,
+    )
+    raw = serialize_post(post)
+
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.json.return_value = {"sha": "sha1", "content": encode_content(raw)}
+    put_resp = MagicMock()
+    put_resp.status_code = 200
+
+    with patch.dict(os.environ, {**_ENV, "ALLOWED_WRITERS": "owner@example.com"}), \
+         _auth_patch(email="owner@example.com"), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.put", return_value=put_resp):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
+            url="/api/posts/legacy-post",
+            params={},
+            headers={},
+            route_params={"slug": "legacy-post"},
+        )
+        resp = function_app.update_post(req)
+
+    assert resp.status_code == 200
+
+
 def test_update_post_not_found():
     """PUT /api/posts/missing with auth but missing file returns 404."""
     get_resp = MagicMock()
     get_resp.status_code = 404
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(), \
+         patch("requests.get", return_value=get_resp):
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
             url="/api/posts/missing",
             params={},
-            headers=_make_auth_header(),
+            headers={},
             route_params={"slug": "missing"},
         )
         resp = function_app.update_post(req)
@@ -318,7 +446,7 @@ def test_update_post_not_found():
 
 
 def test_update_post_requires_auth():
-    """PUT /api/posts/test-slug without X-MS-CLIENT-PRINCIPAL returns 401."""
+    """PUT /api/posts/test-slug without Authorization header returns 401."""
     req = func.HttpRequest(
         method="PUT",
         body=_json.dumps({"title": "Updated", "description": "Desc"}).encode(),
@@ -338,13 +466,25 @@ def test_update_post_requires_auth():
 
 def test_delete_post_success():
     """DELETE /api/posts/test-slug with auth returns 204 with empty body."""
+    post = build_post(
+        title="To Delete",
+        slug="test-slug",
+        date="2026-01-01T00:00:00+00:00",
+        description="A post to delete",
+        body="body",
+        published=True,
+        author_email="test@example.com",
+    )
+    raw = serialize_post(post)
+
     get_resp = MagicMock()
     get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "abc123", "content": encode_content("---\nslug: test-slug\n---\n")}
+    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
     del_resp = MagicMock()
     del_resp.status_code = 200
 
     with patch.dict(os.environ, _ENV), \
+         _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
          patch("requests.delete", return_value=del_resp):
         req = func.HttpRequest(
@@ -352,7 +492,7 @@ def test_delete_post_success():
             body=b"",
             url="/api/posts/test-slug",
             params={},
-            headers=_make_auth_header(),
+            headers={},
             route_params={"slug": "test-slug"},
         )
         resp = function_app.delete_post(req)
@@ -361,18 +501,53 @@ def test_delete_post_success():
     assert resp.get_body() == b""
 
 
+def test_delete_post_ownership_mismatch():
+    """DELETE /api/posts/test-slug returns 403 when requester is not the author."""
+    post = build_post(
+        title="Alice's Post",
+        slug="test-slug",
+        date="2026-01-01T00:00:00+00:00",
+        description="Alice wrote this",
+        body="body",
+        published=True,
+        author_email="alice@example.com",
+    )
+    raw = serialize_post(post)
+
+    get_resp = MagicMock()
+    get_resp.status_code = 200
+    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="bob@example.com"), \
+         patch("requests.get", return_value=get_resp):
+        req = func.HttpRequest(
+            method="DELETE",
+            body=b"",
+            url="/api/posts/test-slug",
+            params={},
+            headers={},
+            route_params={"slug": "test-slug"},
+        )
+        resp = function_app.delete_post(req)
+
+    assert resp.status_code == 403
+
+
 def test_delete_post_not_found():
     """DELETE /api/posts/missing with auth but missing file returns 404."""
     get_resp = MagicMock()
     get_resp.status_code = 404
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(), \
+         patch("requests.get", return_value=get_resp):
         req = func.HttpRequest(
             method="DELETE",
             body=b"",
             url="/api/posts/missing",
             params={},
-            headers=_make_auth_header(),
+            headers={},
             route_params={"slug": "missing"},
         )
         resp = function_app.delete_post(req)
@@ -381,7 +556,7 @@ def test_delete_post_not_found():
 
 
 def test_delete_post_requires_auth():
-    """DELETE /api/posts/test-slug without X-MS-CLIENT-PRINCIPAL returns 401."""
+    """DELETE /api/posts/test-slug without Authorization header returns 401."""
     req = func.HttpRequest(
         method="DELETE",
         body=b"",

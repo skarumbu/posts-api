@@ -11,8 +11,8 @@ from schema import build_post, validate_post, serialize_post
 from slugs import generate_slug, get_file_sha, list_posts_dir, create_file, update_file, delete_file
 from datetime import datetime, timezone
 
-# ANONYMOUS is intentional: read routes (Phase 2/3) are public.
-# Write routes (Phase 4) must validate the Bearer token in the handler before mutating any data.
+# ANONYMOUS is intentional: read routes are public.
+# Write routes validate the Bearer token in the handler before mutating any data.
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 ALLOWED_ORIGIN = "https://www.quixotry.me"
@@ -37,32 +37,44 @@ def _unauthorized(message: str = "Unauthorized") -> func.HttpResponse:
     )
 
 
+def _check_allowlist(email: str) -> bool:
+    """Return True if email is in ALLOWED_WRITERS, or no allowlist is configured."""
+    raw = os.environ.get("ALLOWED_WRITERS", "").strip()
+    if not raw:
+        return True
+    return email.lower() in {e.strip().lower() for e in raw.split(",") if e.strip()}
+
+
 @app.route(route="posts", methods=["POST"])
 def create_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Create a new post (API-03). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth)."""
+    """Create a new post. Requires Google ID token (Authorization: Bearer)."""
     # 1. Auth gate — must be first; no body parsing before auth check (T-06-05)
     try:
-        require_auth(req)
+        _, requester_email = require_auth(req)
     except ValueError:
         return _unauthorized()
 
-    # 2. Parse JSON body
+    # 2. Allowlist check — only permitted writers can create posts
+    if not _check_allowlist(requester_email):
+        return _json_response({"error": "Forbidden"}, status_code=403)
+
+    # 3. Parse JSON body
     try:
         body = req.get_json()
     except Exception:
         return _json_response({"error": "Invalid JSON body"}, status_code=400)
 
-    # 3. Extract fields
+    # 4. Extract fields
     title = (body.get("title") or "").strip()
     description = (body.get("description") or "").strip()
     post_body = (body.get("body") or "").strip()
     published = bool(body.get("published", False))
 
-    # 4. Validate required fields
+    # 5. Validate required fields
     if not title or not description:
         return _json_response({"error": "title and description are required"}, status_code=400)
 
-    # 5. Generate slug, build post, validate, serialize, upload to GitHub
+    # 6. Generate slug, build post, validate, serialize, upload to GitHub
     try:
         slug = generate_slug(title)
         post = build_post(
@@ -72,6 +84,7 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
             description=description,
             body=post_body,
             published=published,
+            author_email=requester_email,
         )
         errors = validate_post(post)
         if errors:
@@ -89,12 +102,12 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="posts/{slug}", methods=["PUT"])
 def update_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Update an existing post (API-04). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth).
-    Preserves original creation date — does not reset to now() on update.
+    """Update an existing post. Requires Google ID token (Authorization: Bearer).
+    Preserves original creation date and author_email.
     """
     # 1. Auth gate — must be first (T-06-05)
     try:
-        require_auth(req)
+        _, requester_email = require_auth(req)
     except ValueError:
         return _unauthorized()
 
@@ -109,17 +122,27 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return _json_response({"error": "Invalid JSON body"}, status_code=400)
 
-    # 4. GET existing file from GitHub — serves as 404 check AND provides SHA + original date (T-06-09, D-14)
+    # 4. GET existing file from GitHub — 404 check, SHA, original date, and author (T-06-09, D-14)
     try:
         sha, raw = get_file_sha(slug)
         if sha is None:
             return _json_response({"error": "not found"}, status_code=404)
         existing = parse_post(raw)
         original_date = existing.metadata.get("date")
+        stored_author = existing.metadata.get("author_email", "")
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
-    # 5. Extract and validate fields
+    # 5. Ownership check
+    if stored_author:
+        if requester_email.lower() != stored_author.lower():
+            return _json_response({"error": "Forbidden"}, status_code=403)
+    else:
+        # Legacy post with no author_email: allowlist members may edit
+        if not _check_allowlist(requester_email):
+            return _json_response({"error": "Forbidden"}, status_code=403)
+
+    # 6. Extract and validate fields
     title = (body.get("title") or "").strip()
     description = (body.get("description") or "").strip()
     post_body = body.get("body", "")
@@ -127,7 +150,7 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
     if not title or not description:
         return _json_response({"error": "title and description are required"}, status_code=400)
 
-    # 6. Build, validate, serialize, upload to GitHub
+    # 7. Build, validate, serialize, upload to GitHub
     try:
         post = build_post(
             title=title,
@@ -137,6 +160,7 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
             body=post_body,
             published=published,
             # updated_at omitted → build_post auto-sets to now()
+            author_email=stored_author or requester_email,  # stamp requester on first edit of legacy post
         )
         errors = validate_post(post)
         if errors:
@@ -163,12 +187,12 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="posts/{slug}", methods=["DELETE"])
 def delete_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete a post by slug (API-05). Requires X-MS-CLIENT-PRINCIPAL (Easy Auth).
-    Returns 204 No Content on success — bare HttpResponse, not _json_response().
+    """Delete a post by slug. Requires Google ID token (Authorization: Bearer).
+    Returns 204 No Content on success.
     """
     # 1. Auth gate — must be first (T-06-05)
     try:
-        require_auth(req)
+        _, requester_email = require_auth(req)
     except ValueError:
         return _unauthorized()
 
@@ -177,11 +201,30 @@ def delete_post(req: func.HttpRequest) -> func.HttpResponse:
     if not slug or not SLUG_RE.match(slug):
         return _json_response({"error": "invalid slug"}, status_code=400)
 
-    # 3. GET SHA first (GitHub DELETE requires current SHA — D-14), then DELETE
+    # 3. GET SHA and content (GitHub DELETE requires current SHA — D-14), check ownership
     try:
-        sha, _ = get_file_sha(slug)
+        sha, raw = get_file_sha(slug)
         if sha is None:
             return _json_response({"error": "not found"}, status_code=404)
+        existing = parse_post(raw)
+        stored_author = existing.metadata.get("author_email", "")
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 422:
+            return _json_response({"error": "conflict"}, status_code=409)
+        return _json_response({"error": "storage error"}, status_code=502)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=502)
+
+    # 4. Ownership check
+    if stored_author:
+        if requester_email.lower() != stored_author.lower():
+            return _json_response({"error": "Forbidden"}, status_code=403)
+    else:
+        if not _check_allowlist(requester_email):
+            return _json_response({"error": "Forbidden"}, status_code=403)
+
+    # 5. DELETE
+    try:
         delete_file(slug, sha, f"post: delete {slug}")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
@@ -190,7 +233,7 @@ def delete_post(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
-    # 4. Return 204 No Content — NOT _json_response() (would write a body)
+    # 6. Return 204 No Content — NOT _json_response() (would write a body)
     return func.HttpResponse(
         status_code=204,
         headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
@@ -248,7 +291,7 @@ def get_post(req: func.HttpRequest) -> func.HttpResponse:
             "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
             "body": post.content,
         })
-    except requests.exceptions.HTTPError as e:
+    except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)

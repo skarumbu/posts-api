@@ -18,6 +18,7 @@ def build_post(
     body: str,
     published: bool = False,
     updated_at: Optional[str] = None,
+    author_email: Optional[str] = None,
 ) -> frontmatter.Post:
     """
     Build a frontmatter.Post object with all 6 required fields set.
@@ -33,6 +34,8 @@ def build_post(
     post["published"] = published
     post["description"] = description
     post["updatedAt"] = updated_at if updated_at is not None else datetime.now(timezone.utc).isoformat()
+    if author_email:
+        post["author_email"] = author_email
     return post
 
 

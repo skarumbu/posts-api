@@ -3,36 +3,37 @@
 CLI for the quixotry.me posts-api.
 
 Required env vars:
-  POSTS_API_BASE_URL      e.g. https://posts-api-xxx.azurewebsites.net
-  POSTS_AZURE_TENANT_ID   Azure AD tenant GUID
-
-Optional env vars:
-  POSTS_TOKEN_CACHE       Path to token cache file (default: ~/.posts-cli-cache.json)
+  POSTS_API_BASE_URL          e.g. https://posts-api-xxx.azurewebsites.net
+  POSTS_GOOGLE_CLIENT_ID      OAuth 2.0 client ID (web client with http://localhost redirect)
+  POSTS_GOOGLE_CLIENT_SECRET  OAuth 2.0 client secret
 
 Sub-commands:
-  login                         Force device-code auth and save token cache
+  login                         Authenticate with Google and cache token
   list                          List all published posts
-  create --title T --description D [--body B] [--published]
-  update <slug> --title T --description D [--body B] [--published]
+  create --title T --description D [--body B] [--body-file F] [--published]
+  update <slug> --title T --description D [--body B] [--body-file F] [--published]
   delete <slug>
 
 First-time setup:
   pip install -r requirements-cli.txt
   export POSTS_API_BASE_URL=https://...
-  export POSTS_AZURE_TENANT_ID=<tenant-guid>
+  export POSTS_GOOGLE_CLIENT_ID=<client-id>
+  export POSTS_GOOGLE_CLIENT_SECRET=<client-secret>
   python post.py login
 """
 
 import argparse
+import base64
 import json
 import os
 import sys
+import time
 
 import requests
-from msal import PublicClientApplication, SerializableTokenCache
+from google_auth_oauthlib.flow import InstalledAppFlow
 
-CLIENT_ID = "825b77cb-1492-406f-9072-923aa536b328"
-SCOPE = ["api://825b77cb-1492-406f-9072-923aa536b328/.default"]
+SCOPES = ["openid", "email"]
+_CACHE = os.path.join(os.path.expanduser("~"), ".posts-cli-google-token.json")
 
 
 def _require_env(name: str) -> str:
@@ -43,66 +44,72 @@ def _require_env(name: str) -> str:
     return val
 
 
-def _cache_path() -> str:
-    return os.environ.get(
-        "POSTS_TOKEN_CACHE",
-        os.path.join(os.path.expanduser("~"), ".posts-cli-cache.json"),
-    )
+def _get_client_config() -> dict:
+    client_id = _require_env("POSTS_GOOGLE_CLIENT_ID")
+    client_secret = _require_env("POSTS_GOOGLE_CLIENT_SECRET")
+    return {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["http://localhost"],
+        }
+    }
 
 
-def _load_cache() -> SerializableTokenCache:
-    cache = SerializableTokenCache()
-    path = _cache_path()
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            cache.deserialize(f.read())
-    return cache
+def _decode_jwt_payload(token: str) -> dict:
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return {}
 
 
-def _save_cache(cache: SerializableTokenCache) -> None:
-    if not cache.has_state_changed:
-        return
-    path = _cache_path()
-    with open(path, "w") as f:
-        f.write(cache.serialize())
-    os.chmod(path, 0o600)
+def _is_id_token_expired(token: str) -> bool:
+    payload = _decode_jwt_payload(token)
+    exp = payload.get("exp", 0)
+    return time.time() > exp - 30
 
 
-def _build_app(cache: SerializableTokenCache) -> PublicClientApplication:
-    tenant_id = _require_env("POSTS_AZURE_TENANT_ID")
-    return PublicClientApplication(
-        client_id=CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{tenant_id}",
-        token_cache=cache,
-    )
+def _load_cached_token() -> str | None:
+    if not os.path.exists(_CACHE):
+        return None
+    try:
+        with open(_CACHE) as f:
+            data = json.load(f)
+        token = data.get("id_token", "")
+        if token and not _is_id_token_expired(token):
+            return token
+    except Exception:
+        pass
+    return None
 
 
-def _get_token(force_login: bool = False) -> str:
-    cache = _load_cache()
-    app = _build_app(cache)
+def _save_token(id_token: str) -> None:
+    with open(_CACHE, "w") as f:
+        json.dump({"id_token": id_token}, f)
+    os.chmod(_CACHE, 0o600)
 
-    token = None
-    if not force_login:
-        accounts = app.get_accounts()
-        if accounts:
-            result = app.acquire_token_silent(SCOPE, account=accounts[0])
-            if result and "access_token" in result:
-                token = result["access_token"]
 
-    if token is None:
-        flow = app.initiate_device_flow(SCOPE)
-        if "user_code" not in flow:
-            print(f"Error initiating device flow: {flow.get('error_description', flow)}", file=sys.stderr)
-            sys.exit(1)
-        print(flow["message"])
-        result = app.acquire_token_by_device_flow(flow)
-        if "access_token" not in result:
-            print(f"Auth failed: {result.get('error_description', result.get('error', 'unknown'))}", file=sys.stderr)
-            sys.exit(1)
-        token = result["access_token"]
+def _do_login() -> str:
+    flow = InstalledAppFlow.from_client_config(_get_client_config(), SCOPES)
+    creds = flow.run_local_server(port=0, prompt="consent")
+    id_token = creds.id_token
+    if not id_token:
+        print("Error: No ID token received from Google. Ensure 'openid' scope is enabled.", file=sys.stderr)
+        sys.exit(1)
+    _save_token(id_token)
+    return id_token
 
-    _save_cache(cache)
-    return token
+
+def _get_token() -> str:
+    token = _load_cached_token()
+    if token:
+        return token
+    print("Token expired or not found — opening browser for Google sign-in…")
+    return _do_login()
 
 
 def _headers(token: str) -> dict:
@@ -116,6 +123,9 @@ def _base_url() -> str:
 def _handle_response(resp: requests.Response, success_status: int = 200) -> dict | None:
     if resp.status_code == 401:
         print("Error: Unauthorized (401). Re-run: python post.py login", file=sys.stderr)
+        sys.exit(1)
+    if resp.status_code == 403:
+        print("Error: Forbidden (403). Your account does not have write access.", file=sys.stderr)
         sys.exit(1)
     if resp.status_code == 404:
         print("Error: Not found (404).", file=sys.stderr)
@@ -136,23 +146,11 @@ def _handle_response(resp: requests.Response, success_status: int = 200) -> dict
 
 
 def cmd_login(_args: argparse.Namespace) -> None:
-    cache = _load_cache()
-    app = _build_app(cache)
-    flow = app.initiate_device_flow(SCOPE)
-    if "user_code" not in flow:
-        print(f"Error initiating device flow: {flow.get('error_description', flow)}", file=sys.stderr)
-        sys.exit(1)
-    print(flow["message"])
-    result = app.acquire_token_by_device_flow(flow)
-    if "access_token" not in result:
-        print(f"Auth failed: {result.get('error_description', result.get('error', 'unknown'))}", file=sys.stderr)
-        sys.exit(1)
-    _save_cache(cache)
-
-    accounts = app.get_accounts()
-    email = accounts[0].get("username", "unknown") if accounts else "unknown"
-    print(f"Logged in as {email}")
-    print(f"Token cache saved to: {_cache_path()}")
+    id_token = _do_login()
+    payload = _decode_jwt_payload(id_token)
+    email = payload.get("email", "unknown")
+    print(f"Signed in as {email}")
+    print(f"Token cached at: {_CACHE}")
 
 
 def cmd_list(_args: argparse.Namespace) -> None:
@@ -169,12 +167,19 @@ def cmd_list(_args: argparse.Namespace) -> None:
         print(f"{p['slug']:<40} {p['title']}")
 
 
+def _resolve_body(args: argparse.Namespace) -> str:
+    if getattr(args, "body_file", None):
+        with open(args.body_file, "r", encoding="utf-8") as f:
+            return f.read()
+    return args.body or ""
+
+
 def cmd_create(args: argparse.Namespace) -> None:
     token = _get_token()
     payload = {
         "title": args.title,
         "description": args.description,
-        "body": args.body or "",
+        "body": _resolve_body(args),
         "published": args.published,
     }
     resp = requests.post(
@@ -191,7 +196,7 @@ def cmd_update(args: argparse.Namespace) -> None:
     payload = {
         "title": args.title,
         "description": args.description,
-        "body": args.body or "",
+        "body": _resolve_body(args),
         "published": args.published,
     }
     resp = requests.put(
@@ -220,13 +225,14 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 
-    sub.add_parser("login", help="Force device-code auth and save token cache")
+    sub.add_parser("login", help="Authenticate with Google and cache token")
     sub.add_parser("list", help="List all published posts")
 
     p_create = sub.add_parser("create", help="Create a new post")
     p_create.add_argument("--title", required=True, help="Post title")
     p_create.add_argument("--description", required=True, help="Post description/subtitle")
     p_create.add_argument("--body", default="", help="Post body (markdown)")
+    p_create.add_argument("--body-file", dest="body_file", help="Read body from file instead of --body")
     p_create.add_argument("--published", action="store_true", help="Publish immediately")
 
     p_update = sub.add_parser("update", help="Update an existing post")
@@ -234,6 +240,7 @@ def main() -> None:
     p_update.add_argument("--title", required=True)
     p_update.add_argument("--description", required=True)
     p_update.add_argument("--body", default="")
+    p_update.add_argument("--body-file", dest="body_file", help="Read body from file instead of --body")
     p_update.add_argument("--published", action="store_true")
 
     p_delete = sub.add_parser("delete", help="Delete a post")

@@ -1,17 +1,29 @@
-import base64
-import json
+import os
+import logging
 
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 import azure.functions as func
 
+logger = logging.getLogger("posts-api")
 
-def require_auth(req: func.HttpRequest) -> tuple[str, str, str]:
-    """Decode EasyAuth principal header. Returns (oid, email, display_name)."""
-    principal_b64 = req.headers.get("X-MS-CLIENT-PRINCIPAL")
-    if not principal_b64:
-        raise ValueError("Unauthenticated")
-    principal = json.loads(base64.b64decode(principal_b64 + "=="))
-    claims = {c["typ"]: c["val"] for c in principal.get("claims", [])}
-    oid = claims.get("http://schemas.microsoft.com/identity/claims/objectidentifier", claims.get("oid", ""))
-    email = claims.get("preferred_username", claims.get("upn", claims.get("email", "")))
-    name = claims.get("name", email)
-    return oid, email, name
+_google_request = google_requests.Request()
+
+
+def require_auth(req: func.HttpRequest) -> tuple[str, str]:
+    """Authenticate request via Google ID token.
+
+    Returns (user_id, email). Raises ValueError if unauthenticated.
+    Expects: Authorization: Bearer <google_id_token>
+    """
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise ValueError("Missing or invalid Authorization header")
+    token = auth_header[len("Bearer "):]
+    try:
+        client_id = os.environ["GOOGLE_CLIENT_ID"]
+        idinfo = id_token.verify_oauth2_token(token, _google_request, client_id)
+        return idinfo["sub"], idinfo["email"]
+    except Exception as e:
+        logger.warning("Google token verification failed: %s", e)
+        raise ValueError("Invalid or expired token") from e
