@@ -7,7 +7,7 @@ import frontmatter
 from datetime import datetime, timezone
 from typing import Optional
 
-REQUIRED_FIELDS: set = {"title", "slug", "date", "published", "description", "updatedAt"}
+REQUIRED_FIELDS: set = {"title", "slug", "date", "published", "updatedAt"}
 
 
 def build_post(

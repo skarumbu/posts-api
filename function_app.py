@@ -71,8 +71,8 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
     published = bool(body.get("published", False))
 
     # 5. Validate required fields
-    if not title or not description:
-        return _json_response({"error": "title and description are required"}, status_code=400)
+    if not title:
+        return _json_response({"error": "title is required"}, status_code=400)
 
     # 6. Generate slug, build post, validate, serialize, upload to GitHub
     try:
@@ -147,8 +147,8 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
     description = (body.get("description") or "").strip()
     post_body = body.get("body", "")
     published = bool(body.get("published", False))
-    if not title or not description:
-        return _json_response({"error": "title and description are required"}, status_code=400)
+    if not title:
+        return _json_response({"error": "title is required"}, status_code=400)
 
     # 7. Build, validate, serialize, upload to GitHub
     try:
