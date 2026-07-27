@@ -1,9 +1,9 @@
 """
-Schema tests for the posts-api post frontmatter schema.
+Schema tests for the posts-api "writing" section frontmatter schema.
 STOR-02: Frontmatter schema defined and validated.
 """
 import pytest
-from schema import build_post, validate_post, serialize_post, parse_post
+from schema_writing import build_post, validate_post, serialize_post, parse_post
 
 
 def test_required_fields_present():
