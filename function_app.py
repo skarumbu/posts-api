@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 import requests
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
 from auth import require_auth
 from sections import SECTIONS
@@ -56,16 +57,78 @@ def _resolve_section(req: func.HttpRequest):
     return cfg, None
 
 
-def _shape_post(post) -> dict:
-    date_val = post.metadata.get("date")
-    updated_val = post.metadata.get("updatedAt")
-    return {
-        "title": post.metadata.get("title"),
-        "slug": post.metadata.get("slug"),
+# ---------------------------------------------------------------------------
+# Content-type dispatch — the one place "markdown" (writing) vs "blocks"
+# (diary) logic branches, since their field shapes genuinely differ. Everything
+# else in this file is section-generic.
+# ---------------------------------------------------------------------------
+
+def _parse_item(cfg, raw: str):
+    if cfg.content_type == "markdown":
+        return cfg.schema.parse_post(raw)
+    return cfg.schema.parse_entry(raw)
+
+
+def _validate_item(cfg, item) -> list:
+    if cfg.content_type == "markdown":
+        return cfg.schema.validate_post(item)
+    return cfg.schema.validate_entry(item)
+
+
+def _serialize_item(cfg, item) -> str:
+    if cfg.content_type == "markdown":
+        return cfg.schema.serialize_post(item)
+    return cfg.schema.serialize_entry(item)
+
+
+def _extract_fields(cfg, body: dict) -> dict:
+    title = (body.get("title") or "").strip()
+    if cfg.content_type == "markdown":
+        return {
+            "title": title,
+            "description": (body.get("description") or "").strip(),
+            "body": body.get("body") or "",
+            "published": bool(body.get("published", False)),
+        }
+    blocks = body.get("blocks")
+    return {"title": title, "blocks": blocks if isinstance(blocks, list) else []}
+
+
+def _build_item(cfg, fields: dict, slug: str, date, author_email: str):
+    if cfg.content_type == "markdown":
+        return cfg.schema.build_post(
+            title=fields["title"],
+            slug=slug,
+            date=date,
+            description=fields["description"],
+            body=fields["body"],
+            published=fields["published"],
+            author_email=author_email,
+        )
+    return cfg.schema.build_entry(
+        title=fields["title"],
+        slug=slug,
+        date=date,
+        blocks=fields["blocks"],
+        author_email=author_email,
+    )
+
+
+def _shape_item(cfg, item) -> dict:
+    date_val = item.metadata.get("date")
+    updated_val = item.metadata.get("updatedAt")
+    shaped = {
+        "title": item.metadata.get("title"),
+        "slug": item.metadata.get("slug"),
         "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
-        "description": post.metadata.get("description"),
         "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
     }
+    if cfg.content_type == "markdown":
+        shaped["description"] = item.metadata.get("description")
+        shaped["published"] = item.metadata.get("published")
+    else:
+        shaped["blocks"] = item.metadata.get("blocks", [])
+    return shaped
 
 
 @app.route(route="sections/{section}/items", methods=["POST"])
@@ -91,34 +154,23 @@ def create_item(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return _json_response({"error": "Invalid JSON body"}, status_code=400)
 
-    # 4. Extract fields
-    title = (body.get("title") or "").strip()
-    description = (body.get("description") or "").strip()
-    post_body = (body.get("body") or "").strip()
-    published = bool(body.get("published", False))
-
-    # 5. Validate required fields
-    if not title:
+    # 4. Extract fields (content-type specific)
+    fields = _extract_fields(cfg, body)
+    if not fields["title"]:
         return _json_response({"error": "title is required"}, status_code=400)
 
-    # 6. Generate slug, build item, validate, serialize, upload to storage
+    # 5. Generate slug, build item, validate, serialize, upload to storage
     try:
-        slug = cfg.storage.generate_slug(title)
-        post = cfg.schema.build_post(
-            title=title,
-            slug=slug,
-            date=datetime.now(timezone.utc).isoformat(),
-            description=description,
-            body=post_body,
-            published=published,
-            author_email=requester_email,
-        )
-        errors = cfg.schema.validate_post(post)
+        slug = cfg.storage.generate_slug(fields["title"])
+        item = _build_item(cfg, fields, slug=slug, date=datetime.now(timezone.utc).isoformat(), author_email=requester_email)
+        errors = _validate_item(cfg, item)
         if errors:
             return _json_response({"error": errors[0]}, status_code=400)
-        content = cfg.schema.serialize_post(post)
+        content = _serialize_item(cfg, item)
         cfg.storage.create(slug, content, f"{cfg.name}: add {slug}")
         return _json_response({"slug": slug}, status_code=201)
+    except (ResourceExistsError, ResourceModifiedError):
+        return _json_response({"error": "conflict"}, status_code=409)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
             return _json_response({"error": "conflict"}, status_code=409)
@@ -158,7 +210,7 @@ def update_item(req: func.HttpRequest) -> func.HttpResponse:
         version_token, raw = cfg.storage.get(slug)
         if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        existing = cfg.schema.parse_post(raw)
+        existing = _parse_item(cfg, raw)
         original_date = existing.metadata.get("date")
         stored_author = existing.metadata.get("author_email", "")
     except Exception:
@@ -173,41 +225,26 @@ def update_item(req: func.HttpRequest) -> func.HttpResponse:
         if not _check_allowlist(requester_email):
             return _json_response({"error": "Forbidden"}, status_code=403)
 
-    # 6. Extract and validate fields
-    title = (body.get("title") or "").strip()
-    description = (body.get("description") or "").strip()
-    post_body = body.get("body", "")
-    published = bool(body.get("published", False))
-    if not title:
+    # 6. Extract and validate fields (content-type specific)
+    fields = _extract_fields(cfg, body)
+    if not fields["title"]:
         return _json_response({"error": "title is required"}, status_code=400)
 
     # 7. Build, validate, serialize, upload to storage
     try:
-        post = cfg.schema.build_post(
-            title=title,
-            slug=slug,
-            date=original_date,   # preserve original creation date
-            description=description,
-            body=post_body,
-            published=published,
-            # updated_at omitted → build_post auto-sets to now()
+        item = _build_item(
+            cfg, fields, slug=slug, date=original_date,
+            # updated_at omitted → build auto-sets to now()
             author_email=stored_author or requester_email,  # stamp requester on first edit of legacy item
         )
-        errors = cfg.schema.validate_post(post)
+        errors = _validate_item(cfg, item)
         if errors:
             return _json_response({"error": errors[0]}, status_code=400)
-        content = cfg.schema.serialize_post(post)
+        content = _serialize_item(cfg, item)
         cfg.storage.update(slug, content, version_token, f"{cfg.name}: update {slug}")
-        date_val = post.metadata.get("date")
-        updated_val = post.metadata.get("updatedAt")
-        return _json_response({
-            "title": post.metadata.get("title"),
-            "slug": post.metadata.get("slug"),
-            "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
-            "description": post.metadata.get("description"),
-            "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
-            "published": post.metadata.get("published"),
-        }, status_code=200)
+        return _json_response(_shape_item(cfg, item), status_code=200)
+    except (ResourceExistsError, ResourceModifiedError):
+        return _json_response({"error": "conflict"}, status_code=409)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
             return _json_response({"error": "conflict"}, status_code=409)
@@ -242,7 +279,7 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
         version_token, raw = cfg.storage.get(slug)
         if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        existing = cfg.schema.parse_post(raw)
+        existing = _parse_item(cfg, raw)
         stored_author = existing.metadata.get("author_email", "")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
@@ -262,6 +299,8 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
     # 5. DELETE
     try:
         cfg.storage.delete(slug, version_token, f"{cfg.name}: delete {slug}")
+    except (ResourceExistsError, ResourceModifiedError):
+        return _json_response({"error": "conflict"}, status_code=409)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
             return _json_response({"error": "conflict"}, status_code=409)
@@ -305,10 +344,10 @@ def list_items(req: func.HttpRequest) -> func.HttpResponse:
         raw_items = cfg.storage.list_all()
         items = []
         for raw in raw_items:
-            post = cfg.schema.parse_post(raw)
-            if cfg.public and post.metadata.get("published") is not True:
+            item = _parse_item(cfg, raw)
+            if cfg.public and item.metadata.get("published") is not True:
                 continue
-            items.append(_shape_post(post))
+            items.append(_shape_item(cfg, item))
         items.sort(key=lambda p: p["date"], reverse=True)
         return _json_response({"items": items})
     except Exception:
@@ -339,11 +378,12 @@ def get_item(req: func.HttpRequest) -> func.HttpResponse:
         version_token, raw = cfg.storage.get(slug)
         if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        post = cfg.schema.parse_post(raw)
-        if cfg.public and post.metadata.get("published") is not True:
+        item = _parse_item(cfg, raw)
+        if cfg.public and item.metadata.get("published") is not True:
             return _json_response({"error": "not found"}, status_code=404)
-        response = _shape_post(post)
-        response["body"] = post.content
+        response = _shape_item(cfg, item)
+        if cfg.content_type == "markdown":
+            response["body"] = item.content
         return _json_response(response)
     except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
