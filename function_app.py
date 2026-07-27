@@ -1,17 +1,15 @@
 import json
 import os
 import re
+from datetime import datetime, timezone
 
 import azure.functions as func
 import requests
 
-from schema import parse_post
 from auth import require_auth
-from schema import build_post, validate_post, serialize_post
-from slugs import generate_slug, get_file_sha, list_posts_dir, create_file, update_file, delete_file
-from datetime import datetime, timezone
+from sections import SECTIONS
 
-# ANONYMOUS is intentional: read routes are public.
+# ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
@@ -45,16 +43,45 @@ def _check_allowlist(email: str) -> bool:
     return email.lower() in {e.strip().lower() for e in raw.split(",") if e.strip()}
 
 
-@app.route(route="posts", methods=["POST"])
-def create_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Create a new post. Requires Google ID token (Authorization: Bearer)."""
+def _resolve_section(req: func.HttpRequest):
+    """Look up the SectionConfig for this request's {section} route param.
+
+    Returns (cfg, None) on success, or (None, error_response) if the section
+    is unknown. Checked before auth — section validity isn't a secret.
+    """
+    section = req.route_params.get("section")
+    cfg = SECTIONS.get(section)
+    if cfg is None:
+        return None, _json_response({"error": "unknown section"}, status_code=404)
+    return cfg, None
+
+
+def _shape_post(post) -> dict:
+    date_val = post.metadata.get("date")
+    updated_val = post.metadata.get("updatedAt")
+    return {
+        "title": post.metadata.get("title"),
+        "slug": post.metadata.get("slug"),
+        "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
+        "description": post.metadata.get("description"),
+        "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
+    }
+
+
+@app.route(route="sections/{section}/items", methods=["POST"])
+def create_item(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a new item in a section. Requires Google ID token (Authorization: Bearer)."""
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+
     # 1. Auth gate — must be first; no body parsing before auth check (T-06-05)
     try:
         _, requester_email = require_auth(req)
     except ValueError:
         return _unauthorized()
 
-    # 2. Allowlist check — only permitted writers can create posts
+    # 2. Allowlist check — only permitted writers can create items
     if not _check_allowlist(requester_email):
         return _json_response({"error": "Forbidden"}, status_code=403)
 
@@ -74,10 +101,10 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
     if not title:
         return _json_response({"error": "title is required"}, status_code=400)
 
-    # 6. Generate slug, build post, validate, serialize, upload to GitHub
+    # 6. Generate slug, build item, validate, serialize, upload to storage
     try:
-        slug = generate_slug(title)
-        post = build_post(
+        slug = cfg.storage.generate_slug(title)
+        post = cfg.schema.build_post(
             title=title,
             slug=slug,
             date=datetime.now(timezone.utc).isoformat(),
@@ -86,11 +113,11 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
             published=published,
             author_email=requester_email,
         )
-        errors = validate_post(post)
+        errors = cfg.schema.validate_post(post)
         if errors:
             return _json_response({"error": errors[0]}, status_code=400)
-        content = serialize_post(post)
-        create_file(slug, content, f"post: add {slug}")
+        content = cfg.schema.serialize_post(post)
+        cfg.storage.create(slug, content, f"{cfg.name}: add {slug}")
         return _json_response({"slug": slug}, status_code=201)
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
@@ -100,11 +127,15 @@ def create_post(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "storage error"}, status_code=502)
 
 
-@app.route(route="posts/{slug}", methods=["PUT"])
-def update_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Update an existing post. Requires Google ID token (Authorization: Bearer).
+@app.route(route="sections/{section}/items/{slug}", methods=["PUT"])
+def update_item(req: func.HttpRequest) -> func.HttpResponse:
+    """Update an existing item. Requires Google ID token (Authorization: Bearer).
     Preserves original creation date and author_email.
     """
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+
     # 1. Auth gate — must be first (T-06-05)
     try:
         _, requester_email = require_auth(req)
@@ -122,12 +153,12 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
     except Exception:
         return _json_response({"error": "Invalid JSON body"}, status_code=400)
 
-    # 4. GET existing file from GitHub — 404 check, SHA, original date, and author (T-06-09, D-14)
+    # 4. GET existing item — 404 check, version token, original date, and author (T-06-09, D-14)
     try:
-        sha, raw = get_file_sha(slug)
-        if sha is None:
+        version_token, raw = cfg.storage.get(slug)
+        if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        existing = parse_post(raw)
+        existing = cfg.schema.parse_post(raw)
         original_date = existing.metadata.get("date")
         stored_author = existing.metadata.get("author_email", "")
     except Exception:
@@ -138,7 +169,7 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
         if requester_email.lower() != stored_author.lower():
             return _json_response({"error": "Forbidden"}, status_code=403)
     else:
-        # Legacy post with no author_email: allowlist members may edit
+        # Legacy item with no author_email: allowlist members may edit
         if not _check_allowlist(requester_email):
             return _json_response({"error": "Forbidden"}, status_code=403)
 
@@ -150,9 +181,9 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
     if not title:
         return _json_response({"error": "title is required"}, status_code=400)
 
-    # 7. Build, validate, serialize, upload to GitHub
+    # 7. Build, validate, serialize, upload to storage
     try:
-        post = build_post(
+        post = cfg.schema.build_post(
             title=title,
             slug=slug,
             date=original_date,   # preserve original creation date
@@ -160,13 +191,13 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
             body=post_body,
             published=published,
             # updated_at omitted → build_post auto-sets to now()
-            author_email=stored_author or requester_email,  # stamp requester on first edit of legacy post
+            author_email=stored_author or requester_email,  # stamp requester on first edit of legacy item
         )
-        errors = validate_post(post)
+        errors = cfg.schema.validate_post(post)
         if errors:
             return _json_response({"error": errors[0]}, status_code=400)
-        content = serialize_post(post)
-        update_file(slug, content, sha, f"post: update {slug}")
+        content = cfg.schema.serialize_post(post)
+        cfg.storage.update(slug, content, version_token, f"{cfg.name}: update {slug}")
         date_val = post.metadata.get("date")
         updated_val = post.metadata.get("updatedAt")
         return _json_response({
@@ -185,11 +216,15 @@ def update_post(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "storage error"}, status_code=502)
 
 
-@app.route(route="posts/{slug}", methods=["DELETE"])
-def delete_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Delete a post by slug. Requires Google ID token (Authorization: Bearer).
+@app.route(route="sections/{section}/items/{slug}", methods=["DELETE"])
+def delete_item(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete an item by slug. Requires Google ID token (Authorization: Bearer).
     Returns 204 No Content on success.
     """
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+
     # 1. Auth gate — must be first (T-06-05)
     try:
         _, requester_email = require_auth(req)
@@ -201,12 +236,13 @@ def delete_post(req: func.HttpRequest) -> func.HttpResponse:
     if not slug or not SLUG_RE.match(slug):
         return _json_response({"error": "invalid slug"}, status_code=400)
 
-    # 3. GET SHA and content (GitHub DELETE requires current SHA — D-14), check ownership
+    # 3. GET version token and content (storage backends require the current
+    #    version token for delete — D-14), check ownership
     try:
-        sha, raw = get_file_sha(slug)
-        if sha is None:
+        version_token, raw = cfg.storage.get(slug)
+        if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        existing = parse_post(raw)
+        existing = cfg.schema.parse_post(raw)
         stored_author = existing.metadata.get("author_email", "")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
@@ -225,7 +261,7 @@ def delete_post(req: func.HttpRequest) -> func.HttpResponse:
 
     # 5. DELETE
     try:
-        delete_file(slug, sha, f"post: delete {slug}")
+        cfg.storage.delete(slug, version_token, f"{cfg.name}: delete {slug}")
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code == 422:
             return _json_response({"error": "conflict"}, status_code=409)
@@ -245,52 +281,70 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response({"status": "ok", "service": "posts-api"})
 
 
-@app.route(route="posts", methods=["GET"])
-def list_posts(req: func.HttpRequest) -> func.HttpResponse:
-    """Return all published posts as a JSON array sorted newest-first (API-01)."""
+@app.route(route="sections/{section}/items", methods=["GET"])
+def list_items(req: func.HttpRequest) -> func.HttpResponse:
+    """Return items in a section as a JSON array sorted newest-first (API-01).
+
+    Public sections (e.g. "writing") return only publicly-visible items,
+    with no auth required. Private sections (e.g. "diary") require auth for
+    every read — there is no per-item visibility flag for those.
+    """
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+
+    if not cfg.public:
+        try:
+            _, requester_email = require_auth(req)
+        except ValueError:
+            return _unauthorized()
+        if not _check_allowlist(requester_email):
+            return _json_response({"error": "Forbidden"}, status_code=403)
+
     try:
-        all_posts = list_posts_dir()
-        posts = []
-        for post in all_posts:
-            if post.metadata.get("published") is True:
-                date_val = post.metadata.get("date")
-                updated_val = post.metadata.get("updatedAt")
-                posts.append({
-                    "title": post.metadata.get("title"),
-                    "slug": post.metadata.get("slug"),
-                    "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
-                    "description": post.metadata.get("description"),
-                    "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
-                })
-        posts.sort(key=lambda p: p["date"], reverse=True)
-        return _json_response({"posts": posts})
+        raw_items = cfg.storage.list_all()
+        items = []
+        for raw in raw_items:
+            post = cfg.schema.parse_post(raw)
+            if cfg.public and post.metadata.get("published") is not True:
+                continue
+            items.append(_shape_post(post))
+        items.sort(key=lambda p: p["date"], reverse=True)
+        return _json_response({"items": items})
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
 
 
-@app.route(route="posts/{slug}", methods=["GET"])
-def get_post(req: func.HttpRequest) -> func.HttpResponse:
-    """Return a single published post by slug (API-02)."""
+@app.route(route="sections/{section}/items/{slug}", methods=["GET"])
+def get_item(req: func.HttpRequest) -> func.HttpResponse:
+    """Return a single item by slug (API-02). Public sections only return
+    publicly-visible items anonymously; private sections require auth."""
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+
     slug = req.route_params.get("slug")
     if not slug or not SLUG_RE.match(slug):
         return _json_response({"error": "invalid slug"}, status_code=400)
+
+    if not cfg.public:
+        try:
+            _, requester_email = require_auth(req)
+        except ValueError:
+            return _unauthorized()
+        if not _check_allowlist(requester_email):
+            return _json_response({"error": "Forbidden"}, status_code=403)
+
     try:
-        sha, raw = get_file_sha(slug)
-        if sha is None:
+        version_token, raw = cfg.storage.get(slug)
+        if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
-        post = parse_post(raw)
-        if post.metadata.get("published") is not True:
+        post = cfg.schema.parse_post(raw)
+        if cfg.public and post.metadata.get("published") is not True:
             return _json_response({"error": "not found"}, status_code=404)
-        date_val = post.metadata.get("date")
-        updated_val = post.metadata.get("updatedAt")
-        return _json_response({
-            "title": post.metadata.get("title"),
-            "slug": post.metadata.get("slug"),
-            "date": date_val.isoformat() if hasattr(date_val, "isoformat") else str(date_val) if date_val is not None else "",
-            "description": post.metadata.get("description"),
-            "updatedAt": updated_val.isoformat() if hasattr(updated_val, "isoformat") else str(updated_val) if updated_val is not None else "",
-            "body": post.content,
-        })
+        response = _shape_post(post)
+        response["body"] = post.content
+        return _json_response(response)
     except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
     except Exception:

@@ -1,7 +1,11 @@
 """
-schema.py — Post frontmatter schema utilities for posts-api.
+schema_writing.py — Post frontmatter schema utilities for the "writing" section of posts-api.
 
 Exports: build_post, validate_post, serialize_post, parse_post, REQUIRED_FIELDS
+
+Renamed from schema.py — behavior is unchanged, this is the schema for the
+public/draft-publish "writing" section specifically (as distinct from the
+private "diary" section's block-based schema).
 """
 import frontmatter
 from datetime import datetime, timezone

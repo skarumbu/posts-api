@@ -155,9 +155,9 @@ def cmd_login(_args: argparse.Namespace) -> None:
 
 def cmd_list(_args: argparse.Namespace) -> None:
     token = _get_token()
-    resp = requests.get(f"{_base_url()}/api/posts", headers=_headers(token))
+    resp = requests.get(f"{_base_url()}/api/sections/writing/items", headers=_headers(token))
     data = _handle_response(resp)
-    posts = data.get("posts", [])
+    posts = data.get("items", [])
     if not posts:
         print("No published posts.")
         return
@@ -183,7 +183,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         "published": args.published,
     }
     resp = requests.post(
-        f"{_base_url()}/api/posts",
+        f"{_base_url()}/api/sections/writing/items",
         headers=_headers(token),
         data=json.dumps(payload),
     )
@@ -200,7 +200,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         "published": args.published,
     }
     resp = requests.put(
-        f"{_base_url()}/api/posts/{args.slug}",
+        f"{_base_url()}/api/sections/writing/items/{args.slug}",
         headers=_headers(token),
         data=json.dumps(payload),
     )
@@ -211,7 +211,7 @@ def cmd_update(args: argparse.Namespace) -> None:
 def cmd_delete(args: argparse.Namespace) -> None:
     token = _get_token()
     resp = requests.delete(
-        f"{_base_url()}/api/posts/{args.slug}",
+        f"{_base_url()}/api/sections/writing/items/{args.slug}",
         headers=_headers(token),
     )
     _handle_response(resp, success_status=204)
