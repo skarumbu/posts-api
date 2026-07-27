@@ -326,12 +326,14 @@ def list_items(req: func.HttpRequest) -> func.HttpResponse:
 
     Public sections (e.g. "writing") return only publicly-visible items,
     with no auth required. Private sections (e.g. "diary") require auth for
-    every read — there is no per-item visibility flag for those.
+    every read, and additionally only ever return items the requester wrote
+    themselves — there is no "share with other writers" concept for those.
     """
     cfg, err = _resolve_section(req)
     if err:
         return err
 
+    requester_email = None
     if not cfg.public:
         try:
             _, requester_email = require_auth(req)
@@ -345,8 +347,15 @@ def list_items(req: func.HttpRequest) -> func.HttpResponse:
         items = []
         for raw in raw_items:
             item = _parse_item(cfg, raw)
-            if cfg.public and item.metadata.get("published") is not True:
-                continue
+            if cfg.public:
+                if item.metadata.get("published") is not True:
+                    continue
+            else:
+                # Legacy items with no stamped author (pre-dates per-item
+                # ownership) remain visible to any allowlisted writer.
+                stored_author = item.metadata.get("author_email", "")
+                if stored_author and stored_author.lower() != requester_email.lower():
+                    continue
             items.append(_shape_item(cfg, item))
         items.sort(key=lambda p: p["date"], reverse=True)
         return _json_response({"items": items})
@@ -357,7 +366,9 @@ def list_items(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="sections/{section}/items/{slug}", methods=["GET"])
 def get_item(req: func.HttpRequest) -> func.HttpResponse:
     """Return a single item by slug (API-02). Public sections only return
-    publicly-visible items anonymously; private sections require auth."""
+    publicly-visible items anonymously; private sections require auth and
+    only ever return an item to the account that wrote it — a wrong-owner
+    request 404s rather than 403ing, so it doesn't confirm the slug exists."""
     cfg, err = _resolve_section(req)
     if err:
         return err
@@ -366,6 +377,7 @@ def get_item(req: func.HttpRequest) -> func.HttpResponse:
     if not slug or not SLUG_RE.match(slug):
         return _json_response({"error": "invalid slug"}, status_code=400)
 
+    requester_email = None
     if not cfg.public:
         try:
             _, requester_email = require_auth(req)
@@ -379,8 +391,13 @@ def get_item(req: func.HttpRequest) -> func.HttpResponse:
         if version_token is None:
             return _json_response({"error": "not found"}, status_code=404)
         item = _parse_item(cfg, raw)
-        if cfg.public and item.metadata.get("published") is not True:
-            return _json_response({"error": "not found"}, status_code=404)
+        if cfg.public:
+            if item.metadata.get("published") is not True:
+                return _json_response({"error": "not found"}, status_code=404)
+        else:
+            stored_author = item.metadata.get("author_email", "")
+            if stored_author and stored_author.lower() != requester_email.lower():
+                return _json_response({"error": "not found"}, status_code=404)
         response = _shape_item(cfg, item)
         if cfg.content_type == "markdown":
             response["body"] = item.content
