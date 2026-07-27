@@ -681,6 +681,74 @@ def test_get_item_diary_requires_auth():
     assert resp.status_code == 401
 
 
+def test_list_items_diary_excludes_other_authors_entries():
+    """GET /api/sections/diary/items only returns entries the requester wrote themselves."""
+    mine = build_entry(
+        title="Mine", slug="mine", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="owner@example.com",
+    )
+    theirs = build_entry(
+        title="Theirs", slug="theirs", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="other@example.com",
+    )
+
+    mine_blob = MagicMock()
+    mine_blob.name = "mine.json"
+    theirs_blob = MagicMock()
+    theirs_blob.name = "theirs.json"
+
+    patcher, mock_container = _mock_diary_container()
+    mock_container.list_blobs.return_value = [mine_blob, theirs_blob]
+
+    def _get_blob_client(path):
+        blob = MagicMock()
+        downloaded = MagicMock()
+        if path == "mine.json":
+            downloaded.readall.return_value = serialize_entry(mine).encode("utf-8")
+        else:
+            downloaded.readall.return_value = serialize_entry(theirs).encode("utf-8")
+        blob.download_blob.return_value = downloaded
+        return blob
+
+    mock_container.get_blob_client.side_effect = _get_blob_client
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items", params={},
+            route_params={"section": "diary"},
+        )
+        resp = function_app.list_items(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert [i["slug"] for i in body["items"]] == ["mine"]
+
+
+def test_get_item_diary_other_authors_entry_404s():
+    """GET /api/sections/diary/items/:slug 404s (not 403) when the entry belongs to a different author."""
+    entry = build_entry(
+        title="Theirs", slug="theirs", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="other@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items/theirs", params={},
+            route_params={"section": "diary", "slug": "theirs"},
+        )
+        resp = function_app.get_item(req)
+
+    assert resp.status_code == 404
+
+
 def test_create_item_diary_success():
     """POST /api/sections/diary/items with auth creates an entry with text+sticker blocks."""
     patcher, mock_container = _mock_diary_container()
