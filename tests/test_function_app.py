@@ -2,9 +2,9 @@
 Tests for function_app.py HTTP handlers.
 
 Covers all section-generic route handlers using unittest.mock.patch on
-requests.get/put/delete, exercised through the "writing" section (the only
-section registered so far). Pure unit tests with GitHub API mocks — no
-external services required.
+requests.get/put/delete for the "writing" section (GitHub-backed), and on
+BlobStorage._container_client for the "diary" section (Blob-backed). Pure
+unit tests with mocked storage — no external services required.
 """
 from unittest.mock import patch, MagicMock
 import base64
@@ -16,6 +16,8 @@ import azure.functions as func
 
 import function_app
 from schema_writing import build_post, serialize_post
+from schema_diary import build_entry, serialize_entry
+from sections import SECTIONS
 
 
 def encode_content(content_str: str) -> str:
@@ -612,3 +614,208 @@ def test_delete_item_requires_auth():
     resp = function_app.delete_item(req)
 
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Diary section (Blob-backed, always private — no per-item visibility flag)
+# ---------------------------------------------------------------------------
+
+def _mock_diary_container():
+    """Patch the diary section's BlobStorage to use a fresh mock container client."""
+    mock_container = MagicMock()
+    patcher = patch.object(SECTIONS["diary"].storage, "_container_client", return_value=mock_container)
+    return patcher, mock_container
+
+
+def test_list_items_diary_requires_auth():
+    """GET /api/sections/diary/items without auth returns 401 — unlike writing, which is public."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/diary/items", params={},
+        route_params={"section": "diary"},
+    )
+    resp = function_app.list_items(req)
+
+    assert resp.status_code == 401
+
+
+def test_list_items_diary_returns_all_entries_no_published_filter():
+    """GET /api/sections/diary/items with auth returns every entry — diary has no published flag."""
+    entry = build_entry(
+        title="Today", slug="today", date="2026-05-30T00:00:00+00:00",
+        blocks=[{"type": "text", "content": "Hi", "style": {}}],
+    )
+    raw = serialize_entry(entry)
+
+    blob_entry = MagicMock()
+    blob_entry.name = "today.json"
+    patcher, mock_container = _mock_diary_container()
+    mock_container.list_blobs.return_value = [blob_entry]
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch():
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items", params={},
+            route_params={"section": "diary"},
+        )
+        resp = function_app.list_items(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert len(body["items"]) == 1
+    assert body["items"][0]["slug"] == "today"
+    assert body["items"][0]["blocks"] == [{"type": "text", "content": "Hi", "style": {}}]
+
+
+def test_get_item_diary_requires_auth():
+    """GET /api/sections/diary/items/:slug without auth returns 401, even for an existing entry."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/diary/items/today", params={},
+        route_params={"section": "diary", "slug": "today"},
+    )
+    resp = function_app.get_item(req)
+
+    assert resp.status_code == 401
+
+
+def test_create_item_diary_success():
+    """POST /api/sections/diary/items with auth creates an entry with text+sticker blocks."""
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    mock_blob.exists.return_value = False
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({
+                "title": "A Good Day",
+                "blocks": [
+                    {"type": "text", "content": "Went for a walk", "style": {"rotation": -2}},
+                    {"type": "sticker", "emoji": "🌻", "style": {}},
+                ],
+            }).encode(),
+            url="/api/sections/diary/items",
+            params={},
+            headers={},
+            route_params={"section": "diary"},
+        )
+        resp = function_app.create_item(req)
+
+    assert resp.status_code == 201
+    body = _json.loads(resp.get_body())
+    assert body["slug"] == "a-good-day"
+    mock_blob.upload_blob.assert_called_once()
+
+
+def test_create_item_diary_missing_title():
+    """POST /api/sections/diary/items with auth but no title returns 400 — no storage access needed."""
+    with _auth_patch():
+        req = func.HttpRequest(
+            method="POST",
+            body=_json.dumps({"blocks": []}).encode(),
+            url="/api/sections/diary/items",
+            params={},
+            headers={},
+            route_params={"section": "diary"},
+        )
+        resp = function_app.create_item(req)
+
+    assert resp.status_code == 400
+
+
+def test_update_item_diary_success():
+    """PUT /api/sections/diary/items/:slug with auth updates blocks and returns the shaped entry."""
+    entry = build_entry(
+        title="Original", slug="today", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="owner@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    downloaded.properties.etag = "etag-1"
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({
+                "title": "Updated Title",
+                "blocks": [{"type": "text", "content": "New entry", "style": {}}],
+            }).encode(),
+            url="/api/sections/diary/items/today",
+            params={},
+            headers={},
+            route_params={"section": "diary", "slug": "today"},
+        )
+        resp = function_app.update_item(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body["title"] == "Updated Title"
+    assert body["blocks"] == [{"type": "text", "content": "New entry", "style": {}}]
+    assert "published" not in body
+
+
+def test_update_item_diary_ownership_mismatch():
+    """PUT on a diary entry returns 403 when requester is not the author."""
+    entry = build_entry(
+        title="Original", slug="today", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="alice@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    downloaded.properties.etag = "etag-1"
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="bob@example.com"):
+        req = func.HttpRequest(
+            method="PUT",
+            body=_json.dumps({"title": "Hacked", "blocks": []}).encode(),
+            url="/api/sections/diary/items/today",
+            params={},
+            headers={},
+            route_params={"section": "diary", "slug": "today"},
+        )
+        resp = function_app.update_item(req)
+
+    assert resp.status_code == 403
+
+
+def test_delete_item_diary_success():
+    """DELETE /api/sections/diary/items/:slug with auth returns 204."""
+    entry = build_entry(
+        title="Today", slug="today", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="owner@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    downloaded.properties.etag = "etag-1"
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="DELETE", body=b"", url="/api/sections/diary/items/today", params={},
+            headers={}, route_params={"section": "diary", "slug": "today"},
+        )
+        resp = function_app.delete_item(req)
+
+    assert resp.status_code == 204
+    mock_blob.delete_blob.assert_called_once()
