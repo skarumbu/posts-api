@@ -1,0 +1,16 @@
+name: Wiki Update PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+jobs:
+  wiki-update-pr:
+    uses: skarumbu/my-website/.github/workflows/wiki-update-pr-reusable.yml@main
+    with:
+      repo_name: posts-api
+    secrets:
+      ARCH_CONTENT_FOUNDRY_KEY: ${{ secrets.ARCH_CONTENT_FOUNDRY_KEY }}
+      WIKI_UPDATE_GH_TOKEN: ${{ secrets.DESIGN_DOC_GH_TOKEN }}
