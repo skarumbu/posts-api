@@ -68,7 +68,13 @@ class HistoryApiStorage:
         resp.raise_for_status()
 
     def delete(self, slug: str, version_token: str, message: str) -> None:
-        resp = requests.delete(f"{self._base_url()}/sections/{self.section}/documents/{slug}", headers=self._headers())
+        resp = requests.delete(
+            f"{self._base_url()}/sections/{self.section}/documents/{slug}",
+            headers=self._headers(),
+            json={"expected_version_id": version_token},
+        )
+        if resp.status_code == 409:
+            raise StorageConflictError(f"Conflict deleting {slug}")
         if resp.status_code not in (204, 404):
             resp.raise_for_status()
 

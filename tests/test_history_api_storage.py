@@ -69,8 +69,16 @@ def test_delete_calls_delete_endpoint():
     resp = MagicMock(status_code=204)
     with patch.dict(os.environ, _ENV), patch("storage.history_api_storage.requests.delete", return_value=resp) as mock_delete:
         HistoryApiStorage(section="writing").delete("my-post", "v1", "writing: delete my-post")
-    args, _ = mock_delete.call_args
+    args, kwargs = mock_delete.call_args
     assert args[0] == "https://history-api-prod.azurewebsites.net/api/sections/writing/documents/my-post"
+    assert kwargs["json"]["expected_version_id"] == "v1"
+
+
+def test_delete_conflict_raises_storage_conflict_error():
+    resp = MagicMock(status_code=409)
+    with patch.dict(os.environ, _ENV), patch("storage.history_api_storage.requests.delete", return_value=resp):
+        with pytest.raises(StorageConflictError):
+            HistoryApiStorage(section="writing").delete("my-post", "stale-version", "msg")
 
 
 def test_slug_exists_true():
