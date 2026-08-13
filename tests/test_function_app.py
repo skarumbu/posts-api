@@ -31,7 +31,12 @@ def _auth_patch(email: str = "test@example.com"):
     return patch("function_app.require_auth", return_value=("google-sub-123", email))
 
 
-_ENV = {"GITHUB_TOKEN": "fake-token", "GITHUB_REPO": "owner/repo"}
+_ENV = {
+    "GITHUB_TOKEN": "fake-token",
+    "GITHUB_REPO": "owner/repo",
+    "HISTORY_API_URL": "https://history-api-prod.azurewebsites.net/api",
+    "HISTORY_API_KEY": "test-machine-key",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -828,16 +833,18 @@ def test_list_versions_diary_requires_auth():
 
 
 def test_list_versions_history_api_error_returns_502():
-    """A history-api connection/HTTP failure degrades gracefully instead of raising unhandled."""
+    """A real upstream HTTP failure from history-api degrades to 502, not 500."""
+    error_resp = MagicMock(status_code=500)
+    error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("boom")
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), requests.exceptions.ConnectionError("boom")]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), error_resp]):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
             route_params={"section": "writing", "slug": "my-post"},
         )
         resp = function_app.list_versions(req)
 
-    assert resp.status_code == 500
+    assert resp.status_code == 502
     body = _json.loads(resp.get_body())
     assert body == {"error": "storage error"}
 

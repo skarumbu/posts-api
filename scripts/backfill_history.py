@@ -18,19 +18,19 @@ import schema_writing
 import schema_diary
 from storage.github_storage import GitHubStorage
 from storage.blob_storage import BlobStorage
+from storage.history_api_storage import _CONTENT_TYPE_BY_SECTION
 
 _PARSERS = {"writing": schema_writing.parse_post, "diary": schema_diary.parse_entry}
-_CONTENT_TYPES = {"writing": "markdown", "diary": "json"}
 
 
 def _slug_exists(history_api_url: str, history_api_key: str, section: str, slug: str) -> bool:
-    resp = requests.get(f"{history_api_url}/sections/{section}/documents/{slug}", headers={"X-History-Key": history_api_key})
+    resp = requests.get(f"{history_api_url}/sections/{section}/documents/{slug}", headers={"X-History-Key": history_api_key}, timeout=(5, 30))
     return resp.status_code == 200
 
 
 def run_backfill(section: str, storage, history_api_url: str, history_api_key: str, force: bool = False) -> dict:
     parse = _PARSERS[section]
-    content_type = _CONTENT_TYPES[section]
+    content_type = _CONTENT_TYPE_BY_SECTION[section]
     imported = 0
     skipped = 0
     failed = 0
@@ -55,6 +55,7 @@ def run_backfill(section: str, storage, history_api_url: str, history_api_key: s
                 f"{history_api_url}/documents/{document_id}/versions",
                 headers={"X-History-Key": history_api_key},
                 json={"content": raw, "content_type": content_type, "message": "backfill: initial import"},
+                timeout=(5, 30),
             )
             resp.raise_for_status()
         except Exception as exc:
@@ -84,6 +85,7 @@ def main():
 
     result = run_backfill(args.section, storage, history_api_url, history_api_key, force=args.force)
     print(f"\nDone: {result['imported']} imported, {result['skipped']} skipped, {result['failed']} failed")
+    return 1 if result["failed"] else 0
 
 
 if __name__ == "__main__":

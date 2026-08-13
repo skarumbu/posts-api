@@ -29,7 +29,7 @@ class HistoryApiStorage:
         return f"{self.section}::{slug}"
 
     def get(self, slug: str) -> tuple[str | None, str | None]:
-        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents/{slug}", headers=self._headers())
+        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents/{slug}", headers=self._headers(), timeout=(5, 30))
         if resp.status_code == 404:
             return None, None
         resp.raise_for_status()
@@ -37,7 +37,7 @@ class HistoryApiStorage:
         return data.get("version_id"), data.get("content")
 
     def list_all(self) -> list[str]:
-        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents", headers=self._headers())
+        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents", headers=self._headers(), timeout=(5, 30))
         resp.raise_for_status()
         documents = resp.json()["documents"]
         contents = []
@@ -48,10 +48,18 @@ class HistoryApiStorage:
         return contents
 
     def create(self, slug: str, content: str, message: str) -> None:
+        # Existence check + POST is a client-side TOCTOU race (another writer
+        # could create the same slug between the two calls). Accepted tradeoff:
+        # generate_slug() already runs before create() in the normal
+        # create_item flow to avoid this race in the common case, and this
+        # codebase has no distributed locking anywhere else either.
+        if self.slug_exists(slug):
+            raise StorageConflictError(f"Conflict creating {slug}")
         resp = requests.post(
             f"{self._base_url()}/documents/{self._document_id(slug)}/versions",
             headers=self._headers(),
             json={"content": content, "content_type": self.content_type, "message": message},
+            timeout=(5, 30),
         )
         if resp.status_code == 409:
             raise StorageConflictError(f"Conflict creating {slug}")
@@ -62,6 +70,7 @@ class HistoryApiStorage:
             f"{self._base_url()}/documents/{self._document_id(slug)}/versions",
             headers=self._headers(),
             json={"content": content, "content_type": self.content_type, "message": message, "expected_version_id": version_token},
+            timeout=(5, 30),
         )
         if resp.status_code == 409:
             raise StorageConflictError(f"Conflict updating {slug}")
@@ -72,6 +81,7 @@ class HistoryApiStorage:
             f"{self._base_url()}/sections/{self.section}/documents/{slug}",
             headers=self._headers(),
             json={"expected_version_id": version_token},
+            timeout=(5, 30),
         )
         if resp.status_code == 409:
             raise StorageConflictError(f"Conflict deleting {slug}")
@@ -79,7 +89,7 @@ class HistoryApiStorage:
             resp.raise_for_status()
 
     def slug_exists(self, slug: str) -> bool:
-        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents/{slug}", headers=self._headers())
+        resp = requests.get(f"{self._base_url()}/sections/{self.section}/documents/{slug}", headers=self._headers(), timeout=(5, 30))
         if resp.status_code == 404:
             return False
         resp.raise_for_status()

@@ -40,14 +40,27 @@ def test_list_all_fetches_every_documents_content():
 
 
 def test_create_posts_version():
-    resp = MagicMock(status_code=201)
-    with patch.dict(os.environ, _ENV), patch("storage.history_api_storage.requests.post", return_value=resp) as mock_post:
+    get_resp = MagicMock(status_code=404)  # slug does not already exist
+    post_resp = MagicMock(status_code=201)
+    with patch.dict(os.environ, _ENV), \
+         patch("storage.history_api_storage.requests.get", return_value=get_resp), \
+         patch("storage.history_api_storage.requests.post", return_value=post_resp) as mock_post:
         HistoryApiStorage(section="writing").create("my-post", "content", "writing: add my-post")
     args, kwargs = mock_post.call_args
     assert args[0] == "https://history-api-prod.azurewebsites.net/api/documents/writing::my-post/versions"
     assert kwargs["json"]["content"] == "content"
     assert kwargs["json"]["content_type"] == "markdown"
     assert kwargs["headers"]["X-History-Key"] == "test-machine-key"
+
+
+def test_create_raises_storage_conflict_error_when_slug_already_exists():
+    get_resp = MagicMock(status_code=200)  # slug already exists
+    with patch.dict(os.environ, _ENV), \
+         patch("storage.history_api_storage.requests.get", return_value=get_resp), \
+         patch("storage.history_api_storage.requests.post") as mock_post:
+        with pytest.raises(StorageConflictError):
+            HistoryApiStorage(section="writing").create("my-post", "content", "writing: add my-post")
+    mock_post.assert_not_called()
 
 
 def test_update_sends_expected_version_id():

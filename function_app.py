@@ -304,12 +304,12 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
-HISTORY_API_URL = os.environ.get("HISTORY_API_URL", "")
-HISTORY_API_KEY = os.environ.get("HISTORY_API_KEY", "")
+def _history_api_url() -> str:
+    return os.environ["HISTORY_API_URL"]
 
 
 def _history_headers() -> dict:
-    return {"X-History-Key": HISTORY_API_KEY}
+    return {"X-History-Key": os.environ["HISTORY_API_KEY"]}
 
 
 def _authorize_version_read(cfg, slug: str, req: func.HttpRequest):
@@ -330,21 +330,20 @@ def _authorize_version_read(cfg, slug: str, req: func.HttpRequest):
 
     try:
         version_token, raw = cfg.storage.get(slug)
+        if version_token is None:
+            return _json_response({"error": "not found"}, status_code=404)
+        item = _parse_item(cfg, raw)
+        if cfg.public:
+            if item.metadata.get("published") is not True:
+                return _json_response({"error": "not found"}, status_code=404)
+        else:
+            stored_author = item.metadata.get("author_email", "")
+            if stored_author and stored_author.lower() != requester_email.lower():
+                return _json_response({"error": "not found"}, status_code=404)
     except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
-
-    if version_token is None:
-        return _json_response({"error": "not found"}, status_code=404)
-    item = _parse_item(cfg, raw)
-    if cfg.public:
-        if item.metadata.get("published") is not True:
-            return _json_response({"error": "not found"}, status_code=404)
-    else:
-        stored_author = item.metadata.get("author_email", "")
-        if stored_author and stored_author.lower() != requester_email.lower():
-            return _json_response({"error": "not found"}, status_code=404)
     return None
 
 
@@ -352,7 +351,8 @@ def _proxy_history_get(url: str) -> func.HttpResponse:
     """GET url from history-api and relay its JSON body/status code, handling
     upstream failures the same way get_item handles storage failures."""
     try:
-        resp = requests.get(url, headers=_history_headers())
+        resp = requests.get(url, headers=_history_headers(), timeout=(5, 30))
+        resp.raise_for_status()
         return _json_response(resp.json(), status_code=resp.status_code)
     except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
@@ -372,7 +372,7 @@ def list_versions(req: func.HttpRequest) -> func.HttpResponse:
     if auth_err:
         return auth_err
     document_id = f"{cfg.name}::{slug}"
-    return _proxy_history_get(f"{HISTORY_API_URL}/documents/{document_id}/versions")
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions")
 
 
 @app.route(route="sections/{section}/items/{slug}/versions/{version_id}", methods=["GET"])
@@ -390,7 +390,7 @@ def get_version(req: func.HttpRequest) -> func.HttpResponse:
     if auth_err:
         return auth_err
     document_id = f"{cfg.name}::{slug}"
-    return _proxy_history_get(f"{HISTORY_API_URL}/documents/{document_id}/versions/{version_id}")
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions/{version_id}")
 
 
 @app.route(route="sections/{section}/items/{slug}/versions/{v1}/diff/{v2}", methods=["GET"])
@@ -409,7 +409,7 @@ def diff_versions(req: func.HttpRequest) -> func.HttpResponse:
     if auth_err:
         return auth_err
     document_id = f"{cfg.name}::{slug}"
-    return _proxy_history_get(f"{HISTORY_API_URL}/documents/{document_id}/versions/{v1}/diff/{v2}")
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions/{v1}/diff/{v2}")
 
 
 @app.route(route="health", methods=["GET"])

@@ -1,6 +1,7 @@
+import os
 from unittest.mock import patch, MagicMock
 
-from scripts.backfill_history import run_backfill
+from scripts.backfill_history import run_backfill, main
 
 
 def test_backfill_skips_existing_slugs_unless_forced():
@@ -101,3 +102,21 @@ def test_backfill_parse_failure_does_not_abort_run():
     assert result["failed"] == 1
     assert result["imported"] == 1
     assert result["skipped"] == 0
+
+
+def test_main_returns_1_when_items_failed():
+    """main() must exit non-zero when any item failed, so an operator running
+    this during production cutover doesn't get a success code on a partial failure."""
+    with patch("scripts.backfill_history.sys.argv", ["backfill_history.py", "--section", "writing"]), \
+         patch.dict(os.environ, {"HISTORY_API_URL": "https://history-api", "HISTORY_API_KEY": "key"}), \
+         patch("scripts.backfill_history.GitHubStorage"), \
+         patch("scripts.backfill_history.run_backfill", return_value={"imported": 0, "skipped": 0, "failed": 1}):
+        assert main() == 1
+
+
+def test_main_returns_0_when_no_failures():
+    with patch("scripts.backfill_history.sys.argv", ["backfill_history.py", "--section", "writing"]), \
+         patch.dict(os.environ, {"HISTORY_API_URL": "https://history-api", "HISTORY_API_KEY": "key"}), \
+         patch("scripts.backfill_history.GitHubStorage"), \
+         patch("scripts.backfill_history.run_backfill", return_value={"imported": 1, "skipped": 0, "failed": 0}):
+        assert main() == 0
