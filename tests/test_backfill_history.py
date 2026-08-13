@@ -1,0 +1,55 @@
+from unittest.mock import patch, MagicMock
+
+from scripts.backfill_history import run_backfill
+
+
+def test_backfill_skips_existing_slugs_unless_forced():
+    fake_storage = MagicMock()
+    fake_storage.list_all.return_value = ['---\ntitle: Hello\nslug: hello\n---\nbody']
+
+    with patch("scripts.backfill_history.schema_writing.parse_post") as mock_parse:
+        mock_parse.return_value = MagicMock(metadata={"slug": "hello"})
+        with patch("scripts.backfill_history.requests.get") as mock_get, \
+             patch("scripts.backfill_history.requests.post") as mock_post:
+            mock_get.return_value = MagicMock(status_code=200)  # slug already exists
+            result = run_backfill("writing", fake_storage, "https://history-api-prod.azurewebsites.net/api", "test-key")
+
+    mock_post.assert_not_called()
+    assert result["skipped"] == 1
+    assert result["imported"] == 0
+
+
+def test_backfill_imports_new_slugs():
+    fake_storage = MagicMock()
+    fake_storage.list_all.return_value = ['---\ntitle: Hello\nslug: hello\n---\nbody']
+
+    with patch("scripts.backfill_history.schema_writing.parse_post") as mock_parse:
+        mock_parse.return_value = MagicMock(metadata={"slug": "hello"})
+        with patch("scripts.backfill_history.requests.get") as mock_get, \
+             patch("scripts.backfill_history.requests.post") as mock_post:
+            mock_get.return_value = MagicMock(status_code=404)  # slug doesn't exist yet
+            mock_post.return_value = MagicMock(status_code=201)
+            result = run_backfill("writing", fake_storage, "https://history-api-prod.azurewebsites.net/api", "test-key")
+
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    assert kwargs["json"]["content_type"] == "markdown"
+    assert kwargs["json"]["message"] == "backfill: initial import"
+    assert result["imported"] == 1
+    assert result["skipped"] == 0
+
+
+def test_backfill_force_reimports_existing_slugs():
+    fake_storage = MagicMock()
+    fake_storage.list_all.return_value = ['---\ntitle: Hello\nslug: hello\n---\nbody']
+
+    with patch("scripts.backfill_history.schema_writing.parse_post") as mock_parse:
+        mock_parse.return_value = MagicMock(metadata={"slug": "hello"})
+        with patch("scripts.backfill_history.requests.get") as mock_get, \
+             patch("scripts.backfill_history.requests.post") as mock_post:
+            mock_get.return_value = MagicMock(status_code=200)
+            mock_post.return_value = MagicMock(status_code=201)
+            result = run_backfill("writing", fake_storage, "https://history-api-prod.azurewebsites.net/api", "test-key", force=True)
+
+    mock_post.assert_called_once()
+    assert result["imported"] == 1
