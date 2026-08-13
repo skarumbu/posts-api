@@ -1,0 +1,8 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "HISTORY_API_URL": "https://history-api-prod.azurewebsites.net/api",
+    "HISTORY_API_KEY": ""
+  }
+}
