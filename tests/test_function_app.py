@@ -749,6 +749,179 @@ def test_get_item_diary_other_authors_entry_404s():
     assert resp.status_code == 404
 
 
+# ---------------------------------------------------------------------------
+# GET .../versions, .../versions/:id, .../versions/:v1/diff/:v2
+# (list_versions, get_version, diff_versions) — proxy straight through to
+# history-api, with the same auth/visibility rules as get_item.
+# ---------------------------------------------------------------------------
+
+def test_list_versions_public_section_no_auth_required():
+    """GET /api/sections/writing/items/:slug/versions needs no auth for a public section."""
+    mock_resp = MagicMock(status_code=200, json=lambda: {"versions": [{"version_id": "v1"}]})
+
+    with patch("requests.get", return_value=mock_resp):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
+            route_params={"section": "writing", "slug": "my-post"},
+        )
+        resp = function_app.list_versions(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body == {"versions": [{"version_id": "v1"}]}
+
+
+def test_list_versions_diary_requires_auth():
+    """GET /api/sections/diary/items/:slug/versions without auth returns 401."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/diary/items/my-entry/versions", params={},
+        route_params={"section": "diary", "slug": "my-entry"},
+    )
+    resp = function_app.list_versions(req)
+
+    assert resp.status_code == 401
+
+
+def test_list_versions_diary_wrong_author_404s():
+    """GET .../versions 404s (not 403) when the entry belongs to a different author."""
+    entry = build_entry(
+        title="Theirs", slug="theirs", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="other@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items/theirs/versions", params={},
+            route_params={"section": "diary", "slug": "theirs"},
+        )
+        resp = function_app.list_versions(req)
+
+    assert resp.status_code == 404
+
+
+def test_list_versions_invalid_slug():
+    """GET .../versions with invalid slug returns 400 — no requests call needed."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items/../etc/versions", params={},
+        route_params={"section": "writing", "slug": "../etc"},
+    )
+    resp = function_app.list_versions(req)
+
+    assert resp.status_code == 400
+
+
+def test_get_version_public_section_no_auth_required():
+    """GET /api/sections/writing/items/:slug/versions/:id needs no auth for a public section."""
+    mock_resp = MagicMock(status_code=200, json=lambda: {"version_id": "v1", "content": "hello"})
+
+    with patch("requests.get", return_value=mock_resp):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1", params={},
+            route_params={"section": "writing", "slug": "my-post", "version_id": "v1"},
+        )
+        resp = function_app.get_version(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body == {"version_id": "v1", "content": "hello"}
+
+
+def test_get_version_diary_requires_auth():
+    """GET .../versions/:id without auth returns 401."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/diary/items/my-entry/versions/v1", params={},
+        route_params={"section": "diary", "slug": "my-entry", "version_id": "v1"},
+    )
+    resp = function_app.get_version(req)
+
+    assert resp.status_code == 401
+
+
+def test_get_version_diary_wrong_author_404s():
+    """GET .../versions/:id 404s (not 403) when the entry belongs to a different author."""
+    entry = build_entry(
+        title="Theirs", slug="theirs", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="other@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items/theirs/versions/v1", params={},
+            route_params={"section": "diary", "slug": "theirs", "version_id": "v1"},
+        )
+        resp = function_app.get_version(req)
+
+    assert resp.status_code == 404
+
+
+def test_diff_versions_public_section_no_auth_required():
+    """GET .../versions/:v1/diff/:v2 needs no auth for a public section."""
+    mock_resp = MagicMock(status_code=200, json=lambda: {"diff": "..."})
+
+    with patch("requests.get", return_value=mock_resp):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1/diff/v2", params={},
+            route_params={"section": "writing", "slug": "my-post", "v1": "v1", "v2": "v2"},
+        )
+        resp = function_app.diff_versions(req)
+
+    assert resp.status_code == 200
+    body = _json.loads(resp.get_body())
+    assert body == {"diff": "..."}
+
+
+def test_diff_versions_diary_requires_auth():
+    """GET .../versions/:v1/diff/:v2 without auth returns 401."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/diary/items/my-entry/versions/v1/diff/v2", params={},
+        route_params={"section": "diary", "slug": "my-entry", "v1": "v1", "v2": "v2"},
+    )
+    resp = function_app.diff_versions(req)
+
+    assert resp.status_code == 401
+
+
+def test_diff_versions_diary_wrong_author_404s():
+    """GET .../versions/:v1/diff/:v2 404s (not 403) when the entry belongs to a different author."""
+    entry = build_entry(
+        title="Theirs", slug="theirs", date="2026-05-30T00:00:00+00:00",
+        blocks=[], author_email="other@example.com",
+    )
+    raw = serialize_entry(entry)
+
+    patcher, mock_container = _mock_diary_container()
+    mock_blob = MagicMock()
+    downloaded = MagicMock()
+    downloaded.readall.return_value = raw.encode("utf-8")
+    mock_blob.download_blob.return_value = downloaded
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patcher, _auth_patch(email="owner@example.com"):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/diary/items/theirs/versions/v1/diff/v2", params={},
+            route_params={"section": "diary", "slug": "theirs", "v1": "v1", "v2": "v2"},
+        )
+        resp = function_app.diff_versions(req)
+
+    assert resp.status_code == 404
+
+
 def test_create_item_diary_success():
     """POST /api/sections/diary/items with auth creates an entry with text+sticker blocks."""
     patcher, mock_container = _mock_diary_container()

@@ -303,6 +303,93 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+HISTORY_API_URL = os.environ.get("HISTORY_API_URL", "")
+HISTORY_API_KEY = os.environ.get("HISTORY_API_KEY", "")
+
+
+def _history_headers() -> dict:
+    return {"X-History-Key": HISTORY_API_KEY}
+
+
+def _check_diary_author(cfg, slug: str, requester_email: str) -> bool:
+    """Mirrors get_item's diary-author-scoping check — only the item's own
+    author may see its version history/diffs."""
+    _, raw = cfg.storage.get(slug)
+    if raw is None:
+        return False
+    item = _parse_item(cfg, raw)
+    stored_author = item.metadata.get("author_email", "")
+    return not stored_author or stored_author.lower() == requester_email.lower()
+
+
+def _authorize_version_read(cfg, slug: str, req: func.HttpRequest):
+    """Returns an error HttpResponse if unauthorized, else None. For public
+    sections, always allowed. For private sections, requires auth + allowlist
+    + matching the item's stored author, same as get_item."""
+    if cfg.public:
+        return None
+    try:
+        _, requester_email = require_auth(req)
+    except ValueError:
+        return _unauthorized()
+    if not _check_allowlist(requester_email):
+        return _json_response({"error": "Forbidden"}, status_code=403)
+    if not _check_diary_author(cfg, slug, requester_email):
+        return _json_response({"error": "not found"}, status_code=404)
+    return None
+
+
+@app.route(route="sections/{section}/items/{slug}/versions", methods=["GET"])
+def list_versions(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    resp = requests.get(f"{HISTORY_API_URL}/documents/{document_id}/versions", headers=_history_headers())
+    return _json_response(resp.json(), status_code=resp.status_code)
+
+
+@app.route(route="sections/{section}/items/{slug}/versions/{version_id}", methods=["GET"])
+def get_version(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    version_id = req.route_params.get("version_id")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    resp = requests.get(f"{HISTORY_API_URL}/documents/{document_id}/versions/{version_id}", headers=_history_headers())
+    return _json_response(resp.json(), status_code=resp.status_code)
+
+
+@app.route(route="sections/{section}/items/{slug}/versions/{v1}/diff/{v2}", methods=["GET"])
+def diff_versions(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    v1 = req.route_params.get("v1")
+    v2 = req.route_params.get("v2")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    resp = requests.get(f"{HISTORY_API_URL}/documents/{document_id}/versions/{v1}/diff/{v2}", headers=_history_headers())
+    return _json_response(resp.json(), status_code=resp.status_code)
+
+
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response({"status": "ok", "service": "posts-api"})
