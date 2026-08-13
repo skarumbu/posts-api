@@ -33,10 +33,16 @@ def run_backfill(section: str, storage, history_api_url: str, history_api_key: s
     content_type = _CONTENT_TYPES[section]
     imported = 0
     skipped = 0
+    failed = 0
 
     for raw in storage.list_all():
-        item = parse(raw)
-        slug = item.metadata["slug"]
+        try:
+            item = parse(raw)
+            slug = item.metadata["slug"]
+        except Exception as exc:
+            print(f"failed to parse item in {section}: {exc}")
+            failed += 1
+            continue
 
         if not force and _slug_exists(history_api_url, history_api_key, section, slug):
             print(f"skip {section}/{slug}: already exists in history-api")
@@ -44,16 +50,22 @@ def run_backfill(section: str, storage, history_api_url: str, history_api_key: s
             continue
 
         document_id = f"{section}::{slug}"
-        resp = requests.post(
-            f"{history_api_url}/documents/{document_id}/versions",
-            headers={"X-History-Key": history_api_key},
-            json={"content": raw, "content_type": content_type, "message": "backfill: initial import"},
-        )
-        resp.raise_for_status()
+        try:
+            resp = requests.post(
+                f"{history_api_url}/documents/{document_id}/versions",
+                headers={"X-History-Key": history_api_key},
+                json={"content": raw, "content_type": content_type, "message": "backfill: initial import"},
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"failed to import {section}/{slug}: {exc}")
+            failed += 1
+            continue
+
         print(f"imported {section}/{slug}")
         imported += 1
 
-    return {"imported": imported, "skipped": skipped}
+    return {"imported": imported, "skipped": skipped, "failed": failed}
 
 
 def main():
@@ -71,7 +83,7 @@ def main():
         storage = BlobStorage(container_env="DIARY_CONTAINER_NAME")
 
     result = run_backfill(args.section, storage, history_api_url, history_api_key, force=args.force)
-    print(f"\nDone: {result['imported']} imported, {result['skipped']} skipped")
+    print(f"\nDone: {result['imported']} imported, {result['skipped']} skipped, {result['failed']} failed")
 
 
 if __name__ == "__main__":
