@@ -915,6 +915,24 @@ def test_get_version_public_section_unpublished_404s():
     assert resp.status_code == 404
 
 
+def test_get_version_missing_version_relays_404():
+    """A well-formed request for a version_id history-api doesn't have relays
+    history-api's 404 body cleanly, instead of being converted into a 502."""
+    history_resp = MagicMock(status_code=404, json=lambda: {"error": "version not found"})
+
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]):
+        req = func.HttpRequest(
+            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/missing", params={},
+            route_params={"section": "writing", "slug": "my-post", "version_id": "missing"},
+        )
+        resp = function_app.get_version(req)
+
+    assert resp.status_code == 404
+    body = _json.loads(resp.get_body())
+    assert body == {"error": "version not found"}
+
+
 def test_get_version_invalid_version_id():
     """GET .../versions/:id with a version_id containing path-unsafe characters returns 400."""
     req = func.HttpRequest(

@@ -352,6 +352,8 @@ def _proxy_history_get(url: str) -> func.HttpResponse:
     upstream failures the same way get_item handles storage failures."""
     try:
         resp = requests.get(url, headers=_history_headers(), timeout=(5, 30))
+        if resp.status_code == 404:
+            return _json_response(resp.json(), status_code=404)
         resp.raise_for_status()
         return _json_response(resp.json(), status_code=resp.status_code)
     except requests.exceptions.HTTPError:
