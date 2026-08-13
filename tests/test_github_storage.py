@@ -4,8 +4,10 @@ GH-01: Slug generation with deduplication via GitHub API probe.
 """
 import os
 import pytest
+import requests
 from unittest.mock import patch, MagicMock
 from storage.github_storage import GitHubStorage
+from storage.errors import StorageConflictError
 
 # Minimal env vars required by _headers() and _file_url()
 _ENV = {
@@ -62,6 +64,16 @@ def test_empty_title_raises():
         with pytest.raises(ValueError):
             GitHubStorage(dir_name="posts").generate_slug("!!!###")
         mock_get.assert_not_called()
+
+
+def test_update_conflict_raises_storage_conflict_error():
+    """update() raises StorageConflictError (not a raw HTTPError) on a 409/422 from GitHub."""
+    conflict_resp = MagicMock()
+    conflict_resp.status_code = 409
+    conflict_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=conflict_resp)
+    with patch.dict(os.environ, _ENV), patch("storage.github_storage.requests.put", return_value=conflict_resp):
+        with pytest.raises(StorageConflictError):
+            GitHubStorage(dir_name="posts").update("hello", "content", "sha123", "msg")
 
 
 def test_dir_name_used_in_file_url():

@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 import requests
-from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
 from auth import require_auth
 from sections import SECTIONS
+from storage.errors import StorageConflictError
 
 # ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
@@ -169,12 +169,8 @@ def create_item(req: func.HttpRequest) -> func.HttpResponse:
         content = _serialize_item(cfg, item)
         cfg.storage.create(slug, content, f"{cfg.name}: add {slug}")
         return _json_response({"slug": slug}, status_code=201)
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
@@ -243,12 +239,8 @@ def update_item(req: func.HttpRequest) -> func.HttpResponse:
         content = _serialize_item(cfg, item)
         cfg.storage.update(slug, content, version_token, f"{cfg.name}: update {slug}")
         return _json_response(_shape_item(cfg, item), status_code=200)
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
@@ -299,12 +291,8 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
     # 5. DELETE
     try:
         cfg.storage.delete(slug, version_token, f"{cfg.name}: delete {slug}")
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 

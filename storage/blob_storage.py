@@ -9,10 +9,12 @@ write operations.
 """
 import os
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.core import MatchConditions
 from azure.storage.blob import BlobServiceClient
 from slugify import slugify
+
+from storage.errors import StorageConflictError
 
 
 class BlobStorage:
@@ -51,24 +53,33 @@ class BlobStorage:
         return contents
 
     def create(self, slug: str, content: str, message: str) -> None:
-        """Create a new blob. Raises azure.core.exceptions.ResourceExistsError on conflict."""
+        """Create a new blob. Raises StorageConflictError if the blob already exists."""
         blob = self._container_client().get_blob_client(f"{slug}.json")
-        blob.upload_blob(content.encode("utf-8"), overwrite=False)
+        try:
+            blob.upload_blob(content.encode("utf-8"), overwrite=False)
+        except ResourceExistsError as exc:
+            raise StorageConflictError(f"Blob already exists: {slug}") from exc
 
     def update(self, slug: str, content: str, version_token: str, message: str) -> None:
         """Update an existing blob, providing its current ETag for optimistic concurrency.
-        Raises azure.core.exceptions.ResourceModifiedError if the ETag doesn't match."""
+        Raises StorageConflictError if the ETag doesn't match."""
         blob = self._container_client().get_blob_client(f"{slug}.json")
-        blob.upload_blob(
-            content.encode("utf-8"),
-            overwrite=True,
-            etag=version_token,
-            match_condition=MatchConditions.IfNotModified,
-        )
+        try:
+            blob.upload_blob(
+                content.encode("utf-8"),
+                overwrite=True,
+                etag=version_token,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except ResourceModifiedError as exc:
+            raise StorageConflictError(f"ETag mismatch updating: {slug}") from exc
 
     def delete(self, slug: str, version_token: str, message: str) -> None:
         blob = self._container_client().get_blob_client(f"{slug}.json")
-        blob.delete_blob(etag=version_token, match_condition=MatchConditions.IfNotModified)
+        try:
+            blob.delete_blob(etag=version_token, match_condition=MatchConditions.IfNotModified)
+        except ResourceModifiedError as exc:
+            raise StorageConflictError(f"ETag mismatch deleting: {slug}") from exc
 
     def slug_exists(self, slug: str) -> bool:
         return self._container_client().get_blob_client(f"{slug}.json").exists()
