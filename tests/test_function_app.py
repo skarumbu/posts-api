@@ -104,7 +104,7 @@ def test_get_item_success():
     raw = serialize_post(post)
     mock_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp) as mock_get:
         req = func.HttpRequest(
             method="GET",
             body=b"",
@@ -118,6 +118,7 @@ def test_get_item_success():
     body = _json.loads(resp.get_body())
     assert "slug" in body
     assert body["slug"] == "test"
+    assert "sections/writing/documents/test" in mock_get.call_args[0][0]
 
 
 def test_get_item_not_found():
@@ -242,7 +243,7 @@ def test_create_item_success():
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.post", return_value=post_resp):
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="POST",
             body=_json.dumps({
@@ -261,6 +262,7 @@ def test_create_item_success():
     assert resp.status_code == 201
     body = _json.loads(resp.get_body())
     assert "slug" in body
+    assert "writing::" in mock_post.call_args[0][0]
 
 
 def test_create_item_unknown_section():
@@ -387,7 +389,7 @@ def test_update_item_success():
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.post", return_value=post_resp):
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({
@@ -407,6 +409,7 @@ def test_update_item_success():
     body = _json.loads(resp.get_body())
     for field in ("title", "slug", "date", "description", "updatedAt", "published"):
         assert field in body, f"Missing field: {field}"
+    assert "writing::" in mock_post.call_args[0][0]
 
 
 def test_update_item_ownership_mismatch():
@@ -530,7 +533,7 @@ def test_delete_item_success():
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.delete", return_value=del_resp):
+         patch("requests.delete", return_value=del_resp) as mock_delete:
         req = func.HttpRequest(
             method="DELETE",
             body=b"",
@@ -543,6 +546,7 @@ def test_delete_item_success():
 
     assert resp.status_code == 204
     assert resp.get_body() == b""
+    assert "sections/writing/documents/test-slug" in mock_delete.call_args[0][0]
 
 
 def test_delete_item_ownership_mismatch():
@@ -703,7 +707,7 @@ def test_get_item_diary_other_authors_entry_404s():
 
     get_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp), _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp) as mock_get, _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items/theirs", params={},
             route_params={"section": "diary", "slug": "theirs"},
@@ -711,6 +715,7 @@ def test_get_item_diary_other_authors_entry_404s():
         resp = function_app.get_item(req)
 
     assert resp.status_code == 404
+    assert "sections/diary/documents/theirs" in mock_get.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1026,7 @@ def test_create_item_diary_success():
     body = _json.loads(resp.get_body())
     assert body["slug"] == "a-good-day"
     mock_post.assert_called_once()
+    assert "diary::" in mock_post.call_args[0][0]
 
 
 def test_create_item_diary_missing_title():
@@ -1053,7 +1059,7 @@ def test_update_item_diary_success():
     with patch.dict(os.environ, _ENV), \
          _auth_patch(email="owner@example.com"), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.post", return_value=post_resp):
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({
@@ -1072,6 +1078,7 @@ def test_update_item_diary_success():
     assert body["title"] == "Updated Title"
     assert body["blocks"] == [{"type": "text", "content": "New entry", "style": {}}]
     assert "published" not in body
+    assert "diary::" in mock_post.call_args[0][0]
 
 
 def test_update_item_diary_ownership_mismatch():
@@ -1123,3 +1130,4 @@ def test_delete_item_diary_success():
 
     assert resp.status_code == 204
     mock_delete.assert_called_once()
+    assert "sections/diary/documents/today" in mock_delete.call_args[0][0]
