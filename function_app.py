@@ -5,10 +5,10 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 import requests
-from azure.core.exceptions import ResourceExistsError, ResourceModifiedError
 
 from auth import require_auth
 from sections import SECTIONS
+from storage.errors import StorageConflictError
 
 # ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
@@ -16,6 +16,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 ALLOWED_ORIGIN = "https://www.quixotry.me"
 SLUG_RE = re.compile(r"^[a-z0-9-]+$")
+VERSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _json_response(data: dict, status_code: int = 200) -> func.HttpResponse:
@@ -169,12 +170,8 @@ def create_item(req: func.HttpRequest) -> func.HttpResponse:
         content = _serialize_item(cfg, item)
         cfg.storage.create(slug, content, f"{cfg.name}: add {slug}")
         return _json_response({"slug": slug}, status_code=201)
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
@@ -243,12 +240,8 @@ def update_item(req: func.HttpRequest) -> func.HttpResponse:
         content = _serialize_item(cfg, item)
         cfg.storage.update(slug, content, version_token, f"{cfg.name}: update {slug}")
         return _json_response(_shape_item(cfg, item), status_code=200)
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
@@ -299,12 +292,8 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
     # 5. DELETE
     try:
         cfg.storage.delete(slug, version_token, f"{cfg.name}: delete {slug}")
-    except (ResourceExistsError, ResourceModifiedError):
+    except StorageConflictError:
         return _json_response({"error": "conflict"}, status_code=409)
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 422:
-            return _json_response({"error": "conflict"}, status_code=409)
-        return _json_response({"error": "storage error"}, status_code=502)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=502)
 
@@ -313,6 +302,116 @@ def delete_item(req: func.HttpRequest) -> func.HttpResponse:
         status_code=204,
         headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
     )
+
+
+def _history_api_url() -> str:
+    return os.environ["HISTORY_API_URL"]
+
+
+def _history_headers() -> dict:
+    return {"X-History-Key": os.environ["HISTORY_API_KEY"]}
+
+
+def _authorize_version_read(cfg, slug: str, req: func.HttpRequest):
+    """Returns an error HttpResponse if unauthorized, else None. Mirrors
+    get_item's exact visibility rules: public sections still require the
+    item to exist and be published (anonymous callers must not be able to
+    read version history/diffs of an unpublished draft); private sections
+    require auth + allowlist + matching the item's stored author. Storage
+    errors are handled the same way get_item handles them."""
+    requester_email = None
+    if not cfg.public:
+        try:
+            _, requester_email = require_auth(req)
+        except ValueError:
+            return _unauthorized()
+        if not _check_allowlist(requester_email):
+            return _json_response({"error": "Forbidden"}, status_code=403)
+
+    try:
+        version_token, raw = cfg.storage.get(slug)
+        if version_token is None:
+            return _json_response({"error": "not found"}, status_code=404)
+        item = _parse_item(cfg, raw)
+        if cfg.public:
+            if item.metadata.get("published") is not True:
+                return _json_response({"error": "not found"}, status_code=404)
+        else:
+            stored_author = item.metadata.get("author_email", "")
+            if stored_author and stored_author.lower() != requester_email.lower():
+                return _json_response({"error": "not found"}, status_code=404)
+    except requests.exceptions.HTTPError:
+        return _json_response({"error": "storage error"}, status_code=502)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+    return None
+
+
+def _proxy_history_get(url: str) -> func.HttpResponse:
+    """GET url from history-api and relay its JSON body/status code, handling
+    upstream failures the same way get_item handles storage failures."""
+    try:
+        resp = requests.get(url, headers=_history_headers(), timeout=(5, 30))
+        if resp.status_code == 404:
+            return _json_response(resp.json(), status_code=404)
+        resp.raise_for_status()
+        return _json_response(resp.json(), status_code=resp.status_code)
+    except requests.exceptions.HTTPError:
+        return _json_response({"error": "storage error"}, status_code=502)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="sections/{section}/items/{slug}/versions", methods=["GET"])
+def list_versions(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions")
+
+
+@app.route(route="sections/{section}/items/{slug}/versions/{version_id}", methods=["GET"])
+def get_version(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    version_id = req.route_params.get("version_id")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    if not version_id or not VERSION_ID_RE.match(version_id):
+        return _json_response({"error": "invalid version_id"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions/{version_id}")
+
+
+@app.route(route="sections/{section}/items/{slug}/versions/{v1}/diff/{v2}", methods=["GET"])
+def diff_versions(req: func.HttpRequest) -> func.HttpResponse:
+    cfg, err = _resolve_section(req)
+    if err:
+        return err
+    slug = req.route_params.get("slug")
+    v1 = req.route_params.get("v1")
+    v2 = req.route_params.get("v2")
+    if not slug or not SLUG_RE.match(slug):
+        return _json_response({"error": "invalid slug"}, status_code=400)
+    if not v1 or not VERSION_ID_RE.match(v1) or not v2 or not VERSION_ID_RE.match(v2):
+        return _json_response({"error": "invalid version_id"}, status_code=400)
+    auth_err = _authorize_version_read(cfg, slug, req)
+    if auth_err:
+        return auth_err
+    document_id = f"{cfg.name}::{slug}"
+    return _proxy_history_get(f"{_history_api_url()}/documents/{document_id}/versions/{v1}/diff/{v2}")
 
 
 @app.route(route="health", methods=["GET"])

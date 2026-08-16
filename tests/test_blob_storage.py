@@ -7,9 +7,10 @@ import os
 from unittest.mock import patch, MagicMock
 
 import pytest
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ResourceModifiedError
 
 from storage.blob_storage import BlobStorage
+from storage.errors import StorageConflictError
 
 _ENV = {
     "POSTS_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true",
@@ -119,6 +120,18 @@ def test_delete_passes_etag():
     mock_blob.delete_blob.assert_called_once()
     _, kwargs = mock_blob.delete_blob.call_args
     assert kwargs.get("etag") == "etag-123"
+
+
+def test_update_conflict_raises_storage_conflict_error():
+    mock_blob = MagicMock()
+    mock_blob.upload_blob.side_effect = ResourceModifiedError("etag mismatch")
+    mock_container = MagicMock()
+    mock_container.get_blob_client.return_value = mock_blob
+
+    with patch.dict(os.environ, _ENV):
+        storage = _storage_with_mocked_container(mock_container)
+        with pytest.raises(StorageConflictError):
+            storage.update("my-slug", '{"title": "Updated"}', "etag-123", "diary: update my-slug")
 
 
 def test_slug_exists_true_and_false():

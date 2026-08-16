@@ -12,6 +12,8 @@ import base64
 import requests
 from slugify import slugify
 
+from storage.errors import StorageConflictError
+
 
 class GitHubStorage:
     """Stores items as .md files under `{dir_name}/{slug}.md` in a GitHub repo."""
@@ -71,6 +73,8 @@ class GitHubStorage:
         content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
         body = {"message": message, "content": content_b64}
         resp = requests.put(self._file_url(slug), headers=self._headers(), json=body)
+        if resp.status_code in (409, 422):
+            raise StorageConflictError(f"GitHub returned {resp.status_code} creating {slug}")
         if resp.status_code not in (200, 201):
             resp.raise_for_status()
 
@@ -78,11 +82,15 @@ class GitHubStorage:
         content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
         body = {"message": message, "content": content_b64, "sha": version_token}
         resp = requests.put(self._file_url(slug), headers=self._headers(), json=body)
+        if resp.status_code in (409, 422):
+            raise StorageConflictError(f"GitHub returned {resp.status_code} updating {slug}")
         resp.raise_for_status()
 
     def delete(self, slug: str, version_token: str, message: str) -> None:
         body = {"message": message, "sha": version_token}
         resp = requests.delete(self._file_url(slug), headers=self._headers(), json=body)
+        if resp.status_code in (409, 422):
+            raise StorageConflictError(f"GitHub returned {resp.status_code} deleting {slug}")
         resp.raise_for_status()
 
     def slug_exists(self, slug: str) -> bool:
