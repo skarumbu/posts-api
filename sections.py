@@ -17,8 +17,7 @@ from typing import Any, Literal
 
 import schema_writing
 import schema_diary
-from storage.github_storage import GitHubStorage
-from storage.blob_storage import BlobStorage
+from storage.history_api_storage import HistoryApiStorage
 
 ContentType = Literal["markdown", "blocks"]
 
@@ -36,14 +35,14 @@ SECTIONS: dict[str, SectionConfig] = {
     "writing": SectionConfig(
         name="writing",
         content_type="markdown",
-        storage=GitHubStorage(dir_name="posts"),
+        storage=HistoryApiStorage(section="writing"),
         public=True,
         schema=schema_writing,
     ),
     "diary": SectionConfig(
         name="diary",
         content_type="blocks",
-        storage=BlobStorage(container_env="DIARY_CONTAINER_NAME"),
+        storage=HistoryApiStorage(section="diary"),
         public=False,
         schema=schema_diary,
     ),
