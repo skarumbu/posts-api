@@ -2,12 +2,12 @@
 Tests for function_app.py HTTP handlers.
 
 Covers all section-generic route handlers using unittest.mock.patch on
-requests.get/put/delete for the "writing" section (GitHub-backed), and on
-BlobStorage._container_client for the "diary" section (Blob-backed). Pure
-unit tests with mocked storage — no external services required.
+requests.get/post/delete — both "writing" and "diary" sections are backed by
+the same HistoryApiStorage class (different `section=` values), so both are
+mocked at the same requests-level HTTP contract. Pure unit tests with mocked
+storage — no external services required.
 """
 from unittest.mock import patch, MagicMock
-import base64
 import json as _json
 import os
 
@@ -21,22 +21,50 @@ from schema_diary import build_entry, serialize_entry
 from sections import SECTIONS
 
 
-def encode_content(content_str: str) -> str:
-    """Encode a string as base64 the way GitHub API returns it (no embedded newlines)."""
-    return base64.b64encode(content_str.encode("utf-8")).decode("ascii")
-
-
 def _auth_patch(email: str = "test@example.com"):
     """Patch require_auth to return the given Google identity without touching real JWT logic."""
     return patch("function_app.require_auth", return_value=("google-sub-123", email))
 
 
 _ENV = {
-    "GITHUB_TOKEN": "fake-token",
-    "GITHUB_REPO": "owner/repo",
     "HISTORY_API_URL": "https://history-api-prod.azurewebsites.net/api",
     "HISTORY_API_KEY": "test-machine-key",
 }
+
+
+# ---------------------------------------------------------------------------
+# HistoryApiStorage response-shape helpers — mirror the request/response
+# contract exercised directly in tests/test_history_api_storage.py.
+# ---------------------------------------------------------------------------
+
+def _storage_get_success(version_id: str, content: str):
+    """A 200 response shaped like GET /sections/{section}/documents/{slug}."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"version_id": version_id, "content": content}
+    return resp
+
+
+def _storage_get_not_found():
+    """A 404 response — HistoryApiStorage.get()/slug_exists() only inspect status_code."""
+    resp = MagicMock()
+    resp.status_code = 404
+    return resp
+
+
+def _storage_list_success(slugs: list):
+    """A 200 response shaped like GET /sections/{section}/documents."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {"documents": [{"slug": s, "latest_version_id": "v1", "content_type": "markdown"} for s in slugs]}
+    return resp
+
+
+def _storage_write_success(status_code: int = 201):
+    """A successful POST (create/update) or DELETE response."""
+    resp = MagicMock()
+    resp.status_code = status_code
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +92,7 @@ def test_unknown_section_returns_404():
 # ---------------------------------------------------------------------------
 
 def test_get_item_success():
-    """GET /api/sections/writing/items/test returns 200 with item data when GitHub returns 200."""
+    """GET /api/sections/writing/items/test returns 200 with item data when history-api returns 200."""
     post = build_post(
         title="Test Post",
         slug="test",
@@ -74,11 +102,9 @@ def test_get_item_success():
         published=True,
     )
     raw = serialize_post(post)
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    mock_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp) as mock_get:
         req = func.HttpRequest(
             method="GET",
             body=b"",
@@ -92,12 +118,12 @@ def test_get_item_success():
     body = _json.loads(resp.get_body())
     assert "slug" in body
     assert body["slug"] == "test"
+    assert "sections/writing/documents/test" in mock_get.call_args[0][0]
 
 
 def test_get_item_not_found():
-    """GET /api/sections/writing/items/missing returns 404 when GitHub returns 404."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 404
+    """GET /api/sections/writing/items/missing returns 404 when history-api returns 404."""
+    mock_resp = _storage_get_not_found()
 
     with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
         req = func.HttpRequest(
@@ -135,12 +161,10 @@ def test_get_item_invalid_slug():
 # ---------------------------------------------------------------------------
 
 def test_list_items_empty():
-    """GET /api/sections/writing/items with empty directory returns 200 and empty items array."""
-    mock_dir_resp = MagicMock()
-    mock_dir_resp.status_code = 200
-    mock_dir_resp.json.return_value = []
+    """GET /api/sections/writing/items with no documents returns 200 and empty items array."""
+    list_resp = _storage_list_success([])
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_dir_resp):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=list_resp):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items", params={},
             route_params={"section": "writing"},
@@ -153,7 +177,7 @@ def test_list_items_empty():
 
 
 def test_list_items_returns_published_only():
-    """GET /api/sections/writing/items returns only published items — directory has one published post."""
+    """GET /api/sections/writing/items returns only published items — one published post exists."""
     post = build_post(
         title="Published Post",
         slug="published-post",
@@ -164,17 +188,10 @@ def test_list_items_returns_published_only():
     )
     raw = serialize_post(post)
 
-    # First GET: directory listing; Second GET: file content
-    dir_resp = MagicMock()
-    dir_resp.status_code = 200
-    dir_resp.json.return_value = [
-        {"name": "published-post.md", "url": "https://api.github.com/repos/owner/repo/contents/posts/published-post.md"},
-    ]
-    file_resp = MagicMock()
-    file_resp.status_code = 200
-    file_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    list_resp = _storage_list_success(["published-post"])
+    content_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[dir_resp, file_resp]):
+    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[list_resp, content_resp]):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items", params={},
             route_params={"section": "writing"},
@@ -188,7 +205,7 @@ def test_list_items_returns_published_only():
 
 
 def test_list_items_excludes_drafts():
-    """GET /api/sections/writing/items returns empty array when directory has only a draft post."""
+    """GET /api/sections/writing/items returns empty array when only a draft post exists."""
     post = build_post(
         title="Draft Post",
         slug="draft-post",
@@ -199,16 +216,10 @@ def test_list_items_excludes_drafts():
     )
     raw = serialize_post(post)
 
-    dir_resp = MagicMock()
-    dir_resp.status_code = 200
-    dir_resp.json.return_value = [
-        {"name": "draft-post.md", "url": "https://api.github.com/repos/owner/repo/contents/posts/draft-post.md"},
-    ]
-    file_resp = MagicMock()
-    file_resp.status_code = 200
-    file_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    list_resp = _storage_list_success(["draft-post"])
+    content_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[dir_resp, file_resp]):
+    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[list_resp, content_resp]):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items", params={},
             route_params={"section": "writing"},
@@ -226,15 +237,13 @@ def test_list_items_excludes_drafts():
 
 def test_create_item_success():
     """POST /api/sections/writing/items with valid Google auth returns 201 with slug."""
-    get_resp = MagicMock()
-    get_resp.status_code = 404
-    put_resp = MagicMock()
-    put_resp.status_code = 201
+    get_resp = _storage_get_not_found()  # slug not taken — generate_slug() + create()'s own check
+    post_resp = _storage_write_success(201)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.put", return_value=put_resp):
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="POST",
             body=_json.dumps({
@@ -253,6 +262,7 @@ def test_create_item_success():
     assert resp.status_code == 201
     body = _json.loads(resp.get_body())
     assert "slug" in body
+    assert "writing::" in mock_post.call_args[0][0]
 
 
 def test_create_item_unknown_section():
@@ -322,25 +332,21 @@ def test_create_item_missing_title():
 
 def test_create_item_stores_author_email():
     """POST /api/sections/writing/items stores author_email in the serialized frontmatter."""
-    get_resp = MagicMock()
-    get_resp.status_code = 404
-    put_resp = MagicMock()
-    put_resp.status_code = 201
+    get_resp = _storage_get_not_found()
 
     captured_body = {}
 
-    def capture_put2(url, **kwargs):
-        import base64 as _b64
-        data = kwargs.get("json") or _json.loads(kwargs.get("data", b"{}"))
-        content_b64 = data.get("content", "")
-        if content_b64:
-            captured_body["content"] = _b64.b64decode(content_b64).decode()
-        return put_resp
+    def capture_post(url, **kwargs):
+        data = kwargs.get("json") or {}
+        content = data.get("content", "")
+        if content:
+            captured_body["content"] = content
+        return _storage_write_success(201)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(email="owner@example.com"), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.put", side_effect=capture_put2):
+         patch("requests.post", side_effect=capture_post):
         req = func.HttpRequest(
             method="POST",
             body=_json.dumps({
@@ -377,16 +383,13 @@ def test_update_item_success():
     )
     raw = serialize_post(post)
 
-    get_resp = MagicMock()
-    get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
-    put_resp = MagicMock()
-    put_resp.status_code = 200
+    get_resp = _storage_get_success("v1", raw)
+    post_resp = _storage_write_success(201)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.put", return_value=put_resp):
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({
@@ -406,6 +409,7 @@ def test_update_item_success():
     body = _json.loads(resp.get_body())
     for field in ("title", "slug", "date", "description", "updatedAt", "published"):
         assert field in body, f"Missing field: {field}"
+    assert "writing::" in mock_post.call_args[0][0]
 
 
 def test_update_item_ownership_mismatch():
@@ -421,9 +425,7 @@ def test_update_item_ownership_mismatch():
     )
     raw = serialize_post(post)
 
-    get_resp = MagicMock()
-    get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    get_resp = _storage_get_success("v1", raw)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(email="bob@example.com"), \
@@ -453,16 +455,13 @@ def test_update_item_legacy_no_author_allowed_writer():
     )
     raw = serialize_post(post)
 
-    get_resp = MagicMock()
-    get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "sha1", "content": encode_content(raw)}
-    put_resp = MagicMock()
-    put_resp.status_code = 200
+    get_resp = _storage_get_success("v1", raw)
+    post_resp = _storage_write_success(200)
 
     with patch.dict(os.environ, {**_ENV, "ALLOWED_WRITERS": "owner@example.com"}), \
          _auth_patch(email="owner@example.com"), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.put", return_value=put_resp):
+         patch("requests.post", return_value=post_resp):
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({"title": "Updated", "description": "Updated desc"}).encode(),
@@ -478,8 +477,7 @@ def test_update_item_legacy_no_author_allowed_writer():
 
 def test_update_item_not_found():
     """PUT with auth but missing item returns 404."""
-    get_resp = MagicMock()
-    get_resp.status_code = 404
+    get_resp = _storage_get_not_found()
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
@@ -529,16 +527,13 @@ def test_delete_item_success():
     )
     raw = serialize_post(post)
 
-    get_resp = MagicMock()
-    get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
-    del_resp = MagicMock()
-    del_resp.status_code = 200
+    get_resp = _storage_get_success("v1", raw)
+    del_resp = _storage_write_success(204)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
          patch("requests.get", return_value=get_resp), \
-         patch("requests.delete", return_value=del_resp):
+         patch("requests.delete", return_value=del_resp) as mock_delete:
         req = func.HttpRequest(
             method="DELETE",
             body=b"",
@@ -551,6 +546,7 @@ def test_delete_item_success():
 
     assert resp.status_code == 204
     assert resp.get_body() == b""
+    assert "sections/writing/documents/test-slug" in mock_delete.call_args[0][0]
 
 
 def test_delete_item_ownership_mismatch():
@@ -566,9 +562,7 @@ def test_delete_item_ownership_mismatch():
     )
     raw = serialize_post(post)
 
-    get_resp = MagicMock()
-    get_resp.status_code = 200
-    get_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
+    get_resp = _storage_get_success("v1", raw)
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(email="bob@example.com"), \
@@ -588,8 +582,7 @@ def test_delete_item_ownership_mismatch():
 
 def test_delete_item_not_found():
     """DELETE with auth but missing item returns 404."""
-    get_resp = MagicMock()
-    get_resp.status_code = 404
+    get_resp = _storage_get_not_found()
 
     with patch.dict(os.environ, _ENV), \
          _auth_patch(), \
@@ -623,15 +616,10 @@ def test_delete_item_requires_auth():
 
 
 # ---------------------------------------------------------------------------
-# Diary section (Blob-backed, always private — no per-item visibility flag)
+# Diary section (HistoryApiStorage-backed, always private — no per-item
+# visibility flag). Same storage class and mocking approach as "writing"
+# above, just section="diary".
 # ---------------------------------------------------------------------------
-
-def _mock_diary_container():
-    """Patch the diary section's BlobStorage to use a fresh mock container client."""
-    mock_container = MagicMock()
-    patcher = patch.object(SECTIONS["diary"].storage, "_container_client", return_value=mock_container)
-    return patcher, mock_container
-
 
 def test_list_items_diary_requires_auth():
     """GET /api/sections/diary/items without auth returns 401 — unlike writing, which is public."""
@@ -652,17 +640,10 @@ def test_list_items_diary_returns_all_entries_no_published_filter():
     )
     raw = serialize_entry(entry)
 
-    blob_entry = MagicMock()
-    blob_entry.name = "today.json"
-    patcher, mock_container = _mock_diary_container()
-    mock_container.list_blobs.return_value = [blob_entry]
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    list_resp = _storage_list_success(["today"])
+    content_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch():
+    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[list_resp, content_resp]), _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items", params={},
             route_params={"section": "diary"},
@@ -698,27 +679,13 @@ def test_list_items_diary_excludes_other_authors_entries():
         blocks=[], author_email="other@example.com",
     )
 
-    mine_blob = MagicMock()
-    mine_blob.name = "mine.json"
-    theirs_blob = MagicMock()
-    theirs_blob.name = "theirs.json"
+    list_resp = _storage_list_success(["mine", "theirs"])
+    mine_resp = _storage_get_success("v1", serialize_entry(mine))
+    theirs_resp = _storage_get_success("v1", serialize_entry(theirs))
 
-    patcher, mock_container = _mock_diary_container()
-    mock_container.list_blobs.return_value = [mine_blob, theirs_blob]
-
-    def _get_blob_client(path):
-        blob = MagicMock()
-        downloaded = MagicMock()
-        if path == "mine.json":
-            downloaded.readall.return_value = serialize_entry(mine).encode("utf-8")
-        else:
-            downloaded.readall.return_value = serialize_entry(theirs).encode("utf-8")
-        blob.download_blob.return_value = downloaded
-        return blob
-
-    mock_container.get_blob_client.side_effect = _get_blob_client
-
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", side_effect=[list_resp, mine_resp, theirs_resp]), \
+         _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items", params={},
             route_params={"section": "diary"},
@@ -738,14 +705,9 @@ def test_get_item_diary_other_authors_entry_404s():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp) as mock_get, _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items/theirs", params={},
             route_params={"section": "diary", "slug": "theirs"},
@@ -753,6 +715,7 @@ def test_get_item_diary_other_authors_entry_404s():
         resp = function_app.get_item(req)
 
     assert resp.status_code == 404
+    assert "sections/diary/documents/theirs" in mock_get.call_args[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -762,31 +725,23 @@ def test_get_item_diary_other_authors_entry_404s():
 # ---------------------------------------------------------------------------
 
 def _published_writing_item_resp():
-    """A GitHub-shaped 200 response for a published writing-section post, for
-    mocking the storage.get() call that _authorize_version_read now makes
-    even for public sections."""
+    """A history-api-shaped 200 response for a published writing-section post, for
+    mocking the storage.get() call that _authorize_version_read makes even for
+    public sections."""
     post = build_post(
         title="Test Post", slug="my-post", date="2026-01-01T00:00:00+00:00",
         description="A test", body="Test body", published=True,
     )
-    raw = serialize_post(post)
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
-    return mock_resp
+    return _storage_get_success("v1", serialize_post(post))
 
 
 def _unpublished_writing_item_resp():
-    """A GitHub-shaped 200 response for an unpublished (draft) writing-section post."""
+    """A history-api-shaped 200 response for an unpublished (draft) writing-section post."""
     post = build_post(
         title="Draft Post", slug="my-post", date="2026-01-01T00:00:00+00:00",
         description="A draft", body="Draft body", published=False,
     )
-    raw = serialize_post(post)
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"sha": "abc123", "content": encode_content(raw)}
-    return mock_resp
+    return _storage_get_success("v1", serialize_post(post))
 
 
 def test_list_versions_public_section_no_auth_required():
@@ -857,14 +812,9 @@ def test_list_versions_diary_wrong_author_404s():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp), _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items/theirs/versions", params={},
             route_params={"section": "diary", "slug": "theirs"},
@@ -963,14 +913,9 @@ def test_get_version_diary_wrong_author_404s():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp), _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items/theirs/versions/v1", params={},
             route_params={"section": "diary", "slug": "theirs", "version_id": "v1"},
@@ -1040,14 +985,9 @@ def test_diff_versions_diary_wrong_author_404s():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=get_resp), _auth_patch(email="owner@example.com"):
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/diary/items/theirs/versions/v1/diff/v2", params={},
             route_params={"section": "diary", "slug": "theirs", "v1": "v1", "v2": "v2"},
@@ -1059,12 +999,13 @@ def test_diff_versions_diary_wrong_author_404s():
 
 def test_create_item_diary_success():
     """POST /api/sections/diary/items with auth creates an entry with text+sticker blocks."""
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    mock_blob.exists.return_value = False
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_not_found()  # slug not taken — generate_slug() + create()'s own check
+    post_resp = _storage_write_success(201)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="owner@example.com"), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="POST",
             body=_json.dumps({
@@ -1084,7 +1025,8 @@ def test_create_item_diary_success():
     assert resp.status_code == 201
     body = _json.loads(resp.get_body())
     assert body["slug"] == "a-good-day"
-    mock_blob.upload_blob.assert_called_once()
+    mock_post.assert_called_once()
+    assert "diary::" in mock_post.call_args[0][0]
 
 
 def test_create_item_diary_missing_title():
@@ -1111,15 +1053,13 @@ def test_update_item_diary_success():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    downloaded.properties.etag = "etag-1"
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
+    post_resp = _storage_write_success(200)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="owner@example.com"), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.post", return_value=post_resp) as mock_post:
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({
@@ -1138,6 +1078,7 @@ def test_update_item_diary_success():
     assert body["title"] == "Updated Title"
     assert body["blocks"] == [{"type": "text", "content": "New entry", "style": {}}]
     assert "published" not in body
+    assert "diary::" in mock_post.call_args[0][0]
 
 
 def test_update_item_diary_ownership_mismatch():
@@ -1148,15 +1089,11 @@ def test_update_item_diary_ownership_mismatch():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    downloaded.properties.etag = "etag-1"
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
 
-    with patcher, _auth_patch(email="bob@example.com"):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="bob@example.com"), \
+         patch("requests.get", return_value=get_resp):
         req = func.HttpRequest(
             method="PUT",
             body=_json.dumps({"title": "Hacked", "blocks": []}).encode(),
@@ -1178,15 +1115,13 @@ def test_delete_item_diary_success():
     )
     raw = serialize_entry(entry)
 
-    patcher, mock_container = _mock_diary_container()
-    mock_blob = MagicMock()
-    downloaded = MagicMock()
-    downloaded.readall.return_value = raw.encode("utf-8")
-    downloaded.properties.etag = "etag-1"
-    mock_blob.download_blob.return_value = downloaded
-    mock_container.get_blob_client.return_value = mock_blob
+    get_resp = _storage_get_success("v1", raw)
+    del_resp = _storage_write_success(204)
 
-    with patcher, _auth_patch(email="owner@example.com"):
+    with patch.dict(os.environ, _ENV), \
+         _auth_patch(email="owner@example.com"), \
+         patch("requests.get", return_value=get_resp), \
+         patch("requests.delete", return_value=del_resp) as mock_delete:
         req = func.HttpRequest(
             method="DELETE", body=b"", url="/api/sections/diary/items/today", params={},
             headers={}, route_params={"section": "diary", "slug": "today"},
@@ -1194,4 +1129,5 @@ def test_delete_item_diary_success():
         resp = function_app.delete_item(req)
 
     assert resp.status_code == 204
-    mock_blob.delete_blob.assert_called_once()
+    mock_delete.assert_called_once()
+    assert "sections/diary/documents/today" in mock_delete.call_args[0][0]
