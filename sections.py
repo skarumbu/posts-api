@@ -36,7 +36,7 @@ SECTIONS: dict[str, SectionConfig] = {
         name="writing",
         content_type="markdown",
         storage=HistoryApiStorage(section="writing"),
-        public=True,
+        public=False,
         schema=schema_writing,
     ),
     "diary": SectionConfig(
