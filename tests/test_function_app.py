@@ -91,6 +91,17 @@ def test_unknown_section_returns_404():
 # GET /api/sections/writing/items/:slug (get_item)
 # ---------------------------------------------------------------------------
 
+def test_get_item_requires_auth():
+    """GET /api/sections/writing/items/:slug without auth returns 401 — writing is private now."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items/test", params={},
+        route_params={"section": "writing", "slug": "test"},
+    )
+    resp = function_app.get_item(req)
+
+    assert resp.status_code == 401
+
+
 def test_get_item_success():
     """GET /api/sections/writing/items/test returns 200 with item data when history-api returns 200."""
     post = build_post(
@@ -104,7 +115,7 @@ def test_get_item_success():
     raw = serialize_post(post)
     mock_resp = _storage_get_success("v1", raw)
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp) as mock_get:
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp) as mock_get, _auth_patch():
         req = func.HttpRequest(
             method="GET",
             body=b"",
@@ -125,7 +136,7 @@ def test_get_item_not_found():
     """GET /api/sections/writing/items/missing returns 404 when history-api returns 404."""
     mock_resp = _storage_get_not_found()
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=mock_resp), _auth_patch():
         req = func.HttpRequest(
             method="GET",
             body=b"",
@@ -160,11 +171,22 @@ def test_get_item_invalid_slug():
 # GET /api/sections/writing/items (list_items)
 # ---------------------------------------------------------------------------
 
+def test_list_items_requires_auth():
+    """GET /api/sections/writing/items without auth returns 401 — writing is private now."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items", params={},
+        route_params={"section": "writing"},
+    )
+    resp = function_app.list_items(req)
+
+    assert resp.status_code == 401
+
+
 def test_list_items_empty():
     """GET /api/sections/writing/items with no documents returns 200 and empty items array."""
     list_resp = _storage_list_success([])
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=list_resp):
+    with patch.dict(os.environ, _ENV), patch("requests.get", return_value=list_resp), _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items", params={},
             route_params={"section": "writing"},
@@ -176,22 +198,25 @@ def test_list_items_empty():
     assert body == {"items": []}
 
 
-def test_list_items_returns_published_only():
-    """GET /api/sections/writing/items returns only published items — one published post exists."""
-    post = build_post(
-        title="Published Post",
-        slug="published-post",
-        date="2026-05-30T00:00:00+00:00",
-        description="A published post",
-        body="Hello world",
-        published=True,
+def test_list_items_includes_drafts_no_published_filter():
+    """GET /api/sections/writing/items with auth returns drafts too — now that writing is
+    private, visibility is ownership-based, not published-based (matching diary)."""
+    published = build_post(
+        title="Published Post", slug="published-post", date="2026-05-30T00:00:00+00:00",
+        description="A published post", body="Hello world", published=True,
     )
-    raw = serialize_post(post)
+    draft = build_post(
+        title="Draft Post", slug="draft-post", date="2026-05-29T00:00:00+00:00",
+        description="A draft", body="Draft body", published=False,
+    )
 
-    list_resp = _storage_list_success(["published-post"])
-    content_resp = _storage_get_success("v1", raw)
+    list_resp = _storage_list_success(["published-post", "draft-post"])
+    published_resp = _storage_get_success("v1", serialize_post(published))
+    draft_resp = _storage_get_success("v1", serialize_post(draft))
 
-    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[list_resp, content_resp]):
+    with patch.dict(os.environ, _ENV), \
+         patch("requests.get", side_effect=[list_resp, published_resp, draft_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items", params={},
             route_params={"section": "writing"},
@@ -200,35 +225,7 @@ def test_list_items_returns_published_only():
 
     assert resp.status_code == 200
     body = _json.loads(resp.get_body())
-    assert len(body["items"]) == 1
-    assert body["items"][0]["slug"] == "published-post"
-
-
-def test_list_items_excludes_drafts():
-    """GET /api/sections/writing/items returns empty array when only a draft post exists."""
-    post = build_post(
-        title="Draft Post",
-        slug="draft-post",
-        date="2026-05-30T00:00:00+00:00",
-        description="A draft",
-        body="Draft body",
-        published=False,
-    )
-    raw = serialize_post(post)
-
-    list_resp = _storage_list_success(["draft-post"])
-    content_resp = _storage_get_success("v1", raw)
-
-    with patch.dict(os.environ, _ENV), patch("requests.get", side_effect=[list_resp, content_resp]):
-        req = func.HttpRequest(
-            method="GET", body=b"", url="/api/sections/writing/items", params={},
-            route_params={"section": "writing"},
-        )
-        resp = function_app.list_items(req)
-
-    assert resp.status_code == 200
-    body = _json.loads(resp.get_body())
-    assert body == {"items": []}
+    assert {i["slug"] for i in body["items"]} == {"published-post", "draft-post"}
 
 
 # ---------------------------------------------------------------------------
@@ -725,9 +722,8 @@ def test_get_item_diary_other_authors_entry_404s():
 # ---------------------------------------------------------------------------
 
 def _published_writing_item_resp():
-    """A history-api-shaped 200 response for a published writing-section post, for
-    mocking the storage.get() call that _authorize_version_read makes even for
-    public sections."""
+    """A history-api-shaped 200 response for a writing-section post, for mocking the
+    storage.get() call that _authorize_version_read makes to check ownership."""
     post = build_post(
         title="Test Post", slug="my-post", date="2026-01-01T00:00:00+00:00",
         description="A test", body="Test body", published=True,
@@ -735,21 +731,26 @@ def _published_writing_item_resp():
     return _storage_get_success("v1", serialize_post(post))
 
 
-def _unpublished_writing_item_resp():
-    """A history-api-shaped 200 response for an unpublished (draft) writing-section post."""
-    post = build_post(
-        title="Draft Post", slug="my-post", date="2026-01-01T00:00:00+00:00",
-        description="A draft", body="Draft body", published=False,
+def test_list_versions_writing_requires_auth():
+    """GET /api/sections/writing/items/:slug/versions without auth returns 401 — writing
+    is private now, matching diary."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
+        route_params={"section": "writing", "slug": "my-post"},
     )
-    return _storage_get_success("v1", serialize_post(post))
+    resp = function_app.list_versions(req)
+
+    assert resp.status_code == 401
 
 
-def test_list_versions_public_section_no_auth_required():
-    """GET /api/sections/writing/items/:slug/versions needs no auth for a public section."""
+def test_list_versions_writing_success_with_auth():
+    """GET /api/sections/writing/items/:slug/versions succeeds for an authenticated
+    owner, regardless of the post's published state."""
     history_resp = MagicMock(status_code=200, json=lambda: {"versions": [{"version_id": "v1"}]})
 
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
             route_params={"section": "writing", "slug": "my-post"},
@@ -759,21 +760,6 @@ def test_list_versions_public_section_no_auth_required():
     assert resp.status_code == 200
     body = _json.loads(resp.get_body())
     assert body == {"versions": [{"version_id": "v1"}]}
-
-
-def test_list_versions_public_section_unpublished_404s():
-    """GET .../versions on an unpublished draft 404s for an anonymous caller,
-    matching get_item's behaviour — anonymous callers must not be able to see
-    version history of a draft even though the section itself is public."""
-    with patch.dict(os.environ, _ENV), \
-         patch("requests.get", return_value=_unpublished_writing_item_resp()):
-        req = func.HttpRequest(
-            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
-            route_params={"section": "writing", "slug": "my-post"},
-        )
-        resp = function_app.list_versions(req)
-
-    assert resp.status_code == 404
 
 
 def test_list_versions_diary_requires_auth():
@@ -792,7 +778,8 @@ def test_list_versions_history_api_error_returns_502():
     error_resp = MagicMock(status_code=500)
     error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("boom")
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), error_resp]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), error_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions", params={},
             route_params={"section": "writing", "slug": "my-post"},
@@ -835,12 +822,26 @@ def test_list_versions_invalid_slug():
     assert resp.status_code == 400
 
 
-def test_get_version_public_section_no_auth_required():
-    """GET /api/sections/writing/items/:slug/versions/:id needs no auth for a public section."""
+def test_get_version_writing_requires_auth():
+    """GET /api/sections/writing/items/:slug/versions/:id without auth returns 401 —
+    writing is private now, matching diary."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1", params={},
+        route_params={"section": "writing", "slug": "my-post", "version_id": "v1"},
+    )
+    resp = function_app.get_version(req)
+
+    assert resp.status_code == 401
+
+
+def test_get_version_writing_success_with_auth():
+    """GET /api/sections/writing/items/:slug/versions/:id succeeds for an authenticated
+    owner, regardless of the post's published state."""
     history_resp = MagicMock(status_code=200, json=lambda: {"version_id": "v1", "content": "hello"})
 
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1", params={},
             route_params={"section": "writing", "slug": "my-post", "version_id": "v1"},
@@ -852,26 +853,14 @@ def test_get_version_public_section_no_auth_required():
     assert body == {"version_id": "v1", "content": "hello"}
 
 
-def test_get_version_public_section_unpublished_404s():
-    """GET .../versions/:id on an unpublished draft 404s for an anonymous caller."""
-    with patch.dict(os.environ, _ENV), \
-         patch("requests.get", return_value=_unpublished_writing_item_resp()):
-        req = func.HttpRequest(
-            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1", params={},
-            route_params={"section": "writing", "slug": "my-post", "version_id": "v1"},
-        )
-        resp = function_app.get_version(req)
-
-    assert resp.status_code == 404
-
-
 def test_get_version_missing_version_relays_404():
     """A well-formed request for a version_id history-api doesn't have relays
     history-api's 404 body cleanly, instead of being converted into a 502."""
     history_resp = MagicMock(status_code=404, json=lambda: {"error": "version not found"})
 
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/missing", params={},
             route_params={"section": "writing", "slug": "my-post", "version_id": "missing"},
@@ -925,12 +914,26 @@ def test_get_version_diary_wrong_author_404s():
     assert resp.status_code == 404
 
 
-def test_diff_versions_public_section_no_auth_required():
-    """GET .../versions/:v1/diff/:v2 needs no auth for a public section."""
+def test_diff_versions_writing_requires_auth():
+    """GET .../versions/:v1/diff/:v2 without auth returns 401 — writing is private now,
+    matching diary."""
+    req = func.HttpRequest(
+        method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1/diff/v2", params={},
+        route_params={"section": "writing", "slug": "my-post", "v1": "v1", "v2": "v2"},
+    )
+    resp = function_app.diff_versions(req)
+
+    assert resp.status_code == 401
+
+
+def test_diff_versions_writing_success_with_auth():
+    """GET .../versions/:v1/diff/:v2 succeeds for an authenticated owner, regardless of
+    the post's published state."""
     history_resp = MagicMock(status_code=200, json=lambda: {"diff": "..."})
 
     with patch.dict(os.environ, _ENV), \
-         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]):
+         patch("requests.get", side_effect=[_published_writing_item_resp(), history_resp]), \
+         _auth_patch():
         req = func.HttpRequest(
             method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1/diff/v2", params={},
             route_params={"section": "writing", "slug": "my-post", "v1": "v1", "v2": "v2"},
@@ -940,19 +943,6 @@ def test_diff_versions_public_section_no_auth_required():
     assert resp.status_code == 200
     body = _json.loads(resp.get_body())
     assert body == {"diff": "..."}
-
-
-def test_diff_versions_public_section_unpublished_404s():
-    """GET .../versions/:v1/diff/:v2 on an unpublished draft 404s for an anonymous caller."""
-    with patch.dict(os.environ, _ENV), \
-         patch("requests.get", return_value=_unpublished_writing_item_resp()):
-        req = func.HttpRequest(
-            method="GET", body=b"", url="/api/sections/writing/items/my-post/versions/v1/diff/v2", params={},
-            route_params={"section": "writing", "slug": "my-post", "v1": "v1", "v2": "v2"},
-        )
-        resp = function_app.diff_versions(req)
-
-    assert resp.status_code == 404
 
 
 def test_diff_versions_invalid_version_id():
