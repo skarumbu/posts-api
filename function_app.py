@@ -11,6 +11,7 @@ from auth import require_auth
 from sections import SECTIONS
 from storage.errors import StorageConflictError
 from daily import checklist as daily_checklist
+from daily import links as daily_links
 
 # ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
@@ -591,5 +592,70 @@ def toggle_checklist_task(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response(dataclasses.asdict(task))
     except ValueError:
         return _json_response({"error": "not found"}, status_code=404)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/links/config", methods=["GET"])
+def get_links_config(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    try:
+        links = daily_links.get_config(email)
+        return _json_response({"links": [dataclasses.asdict(l) for l in links]})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/links/config", methods=["PUT"])
+def set_links_config(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    body, err = _parse_daily_body(req)
+    if err:
+        return err
+    raw_links = body.get("links")
+    if not isinstance(raw_links, list):
+        return _json_response({"error": "links must be a list"}, status_code=400)
+    try:
+        links = [daily_links.LinkDef(id=l["id"], label=l["label"], url=l["url"]) for l in raw_links]
+    except (KeyError, TypeError):
+        return _json_response({"error": "each link needs id, label, url"}, status_code=400)
+    try:
+        daily_links.set_config(email, links)
+        return _json_response({"links": [dataclasses.asdict(l) for l in links]})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/links/opened", methods=["GET"])
+def get_links_opened(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    day_iso, err = _parse_query_date(req)
+    if err:
+        return err
+    try:
+        opened = daily_links.get_opened_today(email, date_cls.fromisoformat(day_iso))
+        return _json_response({"opened": sorted(opened)})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/links/{link_id}/opened", methods=["POST"])
+def mark_link_opened(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    link_id = req.route_params.get("link_id")
+    day_iso, err = _parse_query_date(req)
+    if err:
+        return err
+    try:
+        daily_links.mark_opened(email, date_cls.fromisoformat(day_iso), link_id)
+        return _json_response({"opened": True})
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
