@@ -12,6 +12,7 @@ from sections import SECTIONS
 from storage.errors import StorageConflictError
 from daily import checklist as daily_checklist
 from daily import links as daily_links
+from daily import cards as daily_cards
 
 # ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
@@ -21,6 +22,7 @@ ALLOWED_ORIGIN = "https://www.quixotry.me"
 SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 VERSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 DAILY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+GRADE_VALUES = {"again", "hard", "good", "easy"}
 
 
 def _json_response(data: dict, status_code: int = 200) -> func.HttpResponse:
@@ -657,5 +659,63 @@ def mark_link_opened(req: func.HttpRequest) -> func.HttpResponse:
     try:
         daily_links.mark_opened(email, date_cls.fromisoformat(day_iso), link_id)
         return _json_response({"opened": True})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/cards/due", methods=["GET"])
+def list_due_cards(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    today_iso, err = _parse_query_date(req)
+    if err:
+        return err
+    try:
+        limit = int(req.params.get("limit", 20))
+    except ValueError:
+        return _json_response({"error": "invalid limit"}, status_code=400)
+    try:
+        cards = daily_cards.list_due(email, today_iso, limit=limit)
+        return _json_response({"items": [dataclasses.asdict(c) for c in cards]})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/cards", methods=["POST"])
+def create_index_card(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    body, err = _parse_daily_body(req)
+    if err:
+        return err
+    text = (body.get("text") or "").strip()
+    if not text:
+        return _json_response({"error": "text is required"}, status_code=400)
+    try:
+        card = daily_cards.create_card(email, text)
+        return _json_response(dataclasses.asdict(card), status_code=201)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/cards/{card_id}/review", methods=["POST"])
+def review_index_card(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    body, err = _parse_daily_body(req)
+    if err:
+        return err
+    grade = body.get("grade")
+    if grade not in GRADE_VALUES:
+        return _json_response({"error": f"grade must be one of {sorted(GRADE_VALUES)}"}, status_code=400)
+    card_id = req.route_params.get("card_id")
+    try:
+        card = daily_cards.review_card(email, card_id, grade)
+        return _json_response(dataclasses.asdict(card))
+    except ValueError:
+        return _json_response({"error": "not found"}, status_code=404)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
