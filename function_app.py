@@ -1,7 +1,8 @@
+import dataclasses
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date as date_cls, datetime, timezone
 
 import azure.functions as func
 import requests
@@ -9,6 +10,7 @@ import requests
 from auth import require_auth
 from sections import SECTIONS
 from storage.errors import StorageConflictError
+from daily import checklist as daily_checklist
 
 # ANONYMOUS is intentional: read routes for public sections are public.
 # Write routes validate the Bearer token in the handler before mutating any data.
@@ -17,6 +19,7 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 ALLOWED_ORIGIN = "https://www.quixotry.me"
 SLUG_RE = re.compile(r"^[a-z0-9-]+$")
 VERSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DAILY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _json_response(data: dict, status_code: int = 200) -> func.HttpResponse:
@@ -503,5 +506,90 @@ def get_item(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response(response)
     except requests.exceptions.HTTPError:
         return _json_response({"error": "storage error"}, status_code=502)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Daily tracker (checklist / links / cards) — three new Azure Table Storage
+# tables, not sections: no slug, no history-api, no versioning. Every row is
+# scoped to PartitionKey = author_email, so there is no cross-user ownership
+# check to make here, unlike the slug-addressed /sections/* routes above.
+# ---------------------------------------------------------------------------
+
+def _require_daily_auth(req: func.HttpRequest):
+    """Returns (email, None) on success, or (None, error_response) otherwise."""
+    try:
+        _, email = require_auth(req)
+    except ValueError:
+        return None, _unauthorized()
+    if not _check_allowlist(email):
+        return None, _json_response({"error": "Forbidden"}, status_code=403)
+    return email, None
+
+
+def _parse_daily_body(req: func.HttpRequest):
+    """Returns (body, None) on success, or (None, error_response) otherwise."""
+    try:
+        return req.get_json(), None
+    except Exception:
+        return None, _json_response({"error": "Invalid JSON body"}, status_code=400)
+
+
+def _parse_query_date(req: func.HttpRequest, param: str = "date", default: str | None = None):
+    """Returns (iso_date_str, None) on success, or (None, error_response) otherwise.
+    Falls back to `default` (or today, UTC) when the param is absent."""
+    raw = req.params.get(param)
+    if raw is None:
+        return default or datetime.now(timezone.utc).date().isoformat(), None
+    if not DAILY_DATE_RE.match(raw):
+        return None, _json_response({"error": f"invalid {param}"}, status_code=400)
+    return raw, None
+
+
+@app.route(route="daily/checklist", methods=["GET"])
+def list_checklist_tasks(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    try:
+        tasks = daily_checklist.list_tasks(email)
+        return _json_response({"items": [dataclasses.asdict(t) for t in tasks]})
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/checklist", methods=["POST"])
+def create_checklist_task(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    body, err = _parse_daily_body(req)
+    if err:
+        return err
+    text = (body.get("text") or "").strip()
+    if not text:
+        return _json_response({"error": "text is required"}, status_code=400)
+    try:
+        task = daily_checklist.create_task(email, text=text, expires_after=body.get("expires_after"))
+        return _json_response(dataclasses.asdict(task), status_code=201)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/checklist/{task_id}/toggle", methods=["POST"])
+def toggle_checklist_task(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    task_id = req.route_params.get("task_id")
+    day_iso, err = _parse_query_date(req)
+    if err:
+        return err
+    try:
+        task = daily_checklist.toggle_done(email, task_id, date_cls.fromisoformat(day_iso))
+        return _json_response(dataclasses.asdict(task))
+    except ValueError:
+        return _json_response({"error": "not found"}, status_code=404)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
