@@ -4,12 +4,12 @@ from unittest.mock import patch, MagicMock
 import pytest
 from azure.core.exceptions import ResourceNotFoundError
 
-from daily.cards import IndexCard, schedule_next, list_due, create_card, review_card
+from daily.cards import IndexCard, schedule_next, list_due, create_card, review_card, delete_card
 
 
-def _card(ease=2.5, interval=6, next_review="2026-10-12"):
+def _card(ease=2.5, interval=6, next_review="2026-10-12", back=""):
     return IndexCard(id="c1", text="capital of France", ease_factor=ease, interval_days=interval,
-                      next_review_date=next_review, last_reviewed_date="2026-10-06")
+                      next_review_date=next_review, last_reviewed_date="2026-10-06", back=back)
 
 
 def _entity(card: IndexCard):
@@ -21,6 +21,7 @@ def _entity(card: IndexCard):
         "interval_days": card.interval_days,
         "next_review_date": card.next_review_date,
         "last_reviewed_date": card.last_reviewed_date,
+        "back": card.back,
     }
 
 
@@ -48,6 +49,11 @@ def test_schedule_next_easy_grows_faster_than_good():
     easy = schedule_next(current, "easy", "2026-10-12")
     assert easy.interval_days > good.interval_days
     assert easy.ease_factor > good.ease_factor
+
+
+def test_schedule_next_preserves_back():
+    updated = schedule_next(_card(back="Paris"), "good", "2026-10-12")
+    assert updated.back == "Paris"
 
 
 def test_schedule_next_ease_floors_at_1_3():
@@ -114,3 +120,63 @@ def test_review_card_applies_schedule_next_and_upserts():
 
     assert updated.interval_days == round(6 * 2.5)
     mock_table.upsert_entity.assert_called_once()
+
+
+def test_list_due_round_trips_back():
+    mock_table = MagicMock()
+    mock_table.query_entities.return_value = [_entity(_card(back="Paris"))]
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        due = list_due("user@example.com", "2026-10-12")
+
+    assert due[0].back == "Paris"
+
+
+def test_list_due_loads_legacy_entity_without_back_as_empty():
+    legacy = _entity(_card())
+    del legacy["back"]
+    mock_table = MagicMock()
+    mock_table.query_entities.return_value = [legacy]
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        due = list_due("user@example.com", "2026-10-12")
+
+    assert due[0].back == ""
+
+
+def test_create_card_stores_back():
+    mock_table = MagicMock()
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        card = create_card("user@example.com", "capital of France", back="Paris")
+
+    assert card.back == "Paris"
+    assert mock_table.upsert_entity.call_args[0][0]["back"] == "Paris"
+
+
+def test_review_card_preserves_back():
+    mock_table = MagicMock()
+    mock_table.get_entity.return_value = _entity(_card(back="Paris"))
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        updated = review_card("user@example.com", "c1", "good")
+
+    assert updated.back == "Paris"
+    assert mock_table.upsert_entity.call_args[0][0]["back"] == "Paris"
+
+
+def test_delete_card_deletes_entity():
+    mock_table = MagicMock()
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        delete_card("user@example.com", "c1")
+
+    mock_table.delete_entity.assert_called_once_with(partition_key="user@example.com", row_key="c1")
+
+
+def test_delete_card_missing_is_a_no_op():
+    mock_table = MagicMock()
+    mock_table.delete_entity.side_effect = ResourceNotFoundError("missing")
+
+    with patch("daily.cards.get_table_client", return_value=mock_table):
+        delete_card("user@example.com", "missing")

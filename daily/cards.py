@@ -8,7 +8,7 @@ schedule later needs no migration). Table Storage's OData comparison
 operators do the "due" filter server-side instead of a Python-side scan.
 """
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
@@ -31,6 +31,7 @@ class IndexCard:
     interval_days: int
     next_review_date: str
     last_reviewed_date: str | None = None
+    back: str = ""
 
 
 def schedule_next(current: IndexCard, grade: Grade, today: str) -> IndexCard:
@@ -48,9 +49,8 @@ def schedule_next(current: IndexCard, grade: Grade, today: str) -> IndexCard:
         new_interval = max(1, round(current.interval_days * new_ease))
 
     next_review = (date.fromisoformat(today) + timedelta(days=new_interval)).isoformat()
-    return IndexCard(
-        id=current.id,
-        text=current.text,
+    return replace(
+        current,
         ease_factor=new_ease,
         interval_days=new_interval,
         next_review_date=next_review,
@@ -66,6 +66,7 @@ def _from_entity(entity) -> IndexCard:
         interval_days=entity["interval_days"],
         next_review_date=entity["next_review_date"],
         last_reviewed_date=entity.get("last_reviewed_date"),
+        back=entity.get("back", ""),
     )
 
 
@@ -78,6 +79,7 @@ def _to_entity(user_email: str, card: IndexCard) -> dict:
         "interval_days": card.interval_days,
         "next_review_date": card.next_review_date,
         "last_reviewed_date": card.last_reviewed_date,
+        "back": card.back,
     }
 
 
@@ -94,11 +96,11 @@ def list_due(user_email: str, today: str, limit: int = 20) -> list[IndexCard]:
     return cards[:limit]
 
 
-def create_card(user_email: str, text: str) -> IndexCard:
+def create_card(user_email: str, text: str, back: str = "") -> IndexCard:
     today = datetime.now(timezone.utc).date().isoformat()
     card = IndexCard(
         id=str(uuid.uuid4()), text=text, ease_factor=2.5, interval_days=0,
-        next_review_date=today, last_reviewed_date=None,
+        next_review_date=today, last_reviewed_date=None, back=back,
     )
     get_table_client(TABLE_NAME).upsert_entity(_to_entity(user_email, card))
     return card
@@ -118,3 +120,11 @@ def review_card(user_email: str, card_id: str, grade: Grade) -> IndexCard:
     updated = schedule_next(current, grade, today)
     table.upsert_entity(_to_entity(user_email, updated))
     return updated
+
+
+def delete_card(user_email: str, card_id: str) -> None:
+    """Idempotent: a missing card is a no-op so a retried Undo doesn't error."""
+    try:
+        get_table_client(TABLE_NAME).delete_entity(partition_key=user_email, row_key=card_id)
+    except ResourceNotFoundError:
+        pass

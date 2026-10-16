@@ -3,9 +3,10 @@ Tests for function_app.py's daily/cards/* route handlers. Mocks daily.cards
 directly; the real Table Storage I/O is covered in tests/test_daily_cards.py.
 """
 import json as _json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import azure.functions as func
+from azure.core.exceptions import ResourceNotFoundError
 
 import function_app
 from daily.cards import IndexCard
@@ -53,6 +54,69 @@ def test_create_index_card_requires_text():
             _req("POST", "/api/daily/cards", body=_json.dumps({}).encode())
         )
     assert resp.status_code == 400
+
+
+def test_create_index_card_passes_back():
+    card = IndexCard(id="c1", text="capital of France", ease_factor=2.5, interval_days=0,
+                      next_review_date="2026-10-12", back="Paris")
+    with _auth_patch(), patch("daily.cards.create_card", return_value=card) as mock_create:
+        resp = function_app.create_index_card(
+            _req("POST", "/api/daily/cards",
+                 body=_json.dumps({"text": " capital of France ", "back": " Paris "}).encode())
+        )
+    assert resp.status_code == 201
+    assert _json.loads(resp.get_body())["back"] == "Paris"
+    mock_create.assert_called_once_with("test@example.com", "capital of France", back="Paris")
+
+
+def test_create_index_card_defaults_back_to_empty():
+    card = IndexCard(id="c1", text="capital of France", ease_factor=2.5, interval_days=0,
+                      next_review_date="2026-10-12")
+    for body in ({"text": "capital of France"}, {"text": "capital of France", "back": None}):
+        with _auth_patch(), patch("daily.cards.create_card", return_value=card) as mock_create:
+            resp = function_app.create_index_card(
+                _req("POST", "/api/daily/cards", body=_json.dumps(body).encode())
+            )
+        assert resp.status_code == 201
+        mock_create.assert_called_once_with("test@example.com", "capital of France", back="")
+
+
+def test_create_index_card_rejects_non_string_back():
+    for back in (42, 0, False, ["Paris"]):
+        with _auth_patch(), patch("daily.cards.create_card") as mock_create:
+            resp = function_app.create_index_card(
+                _req("POST", "/api/daily/cards",
+                     body=_json.dumps({"text": "capital of France", "back": back}).encode())
+            )
+        assert resp.status_code == 400, back
+        mock_create.assert_not_called()
+
+
+def test_delete_index_card_requires_auth():
+    resp = function_app.delete_index_card(
+        _req("DELETE", "/api/daily/cards/c1", route_params={"card_id": "c1"})
+    )
+    assert resp.status_code == 401
+
+
+def test_delete_index_card_success():
+    with _auth_patch(), patch("daily.cards.delete_card") as mock_delete:
+        resp = function_app.delete_index_card(
+            _req("DELETE", "/api/daily/cards/c1", route_params={"card_id": "c1"})
+        )
+    assert resp.status_code == 204
+    assert resp.get_body() == b""
+    mock_delete.assert_called_once_with("test@example.com", "c1")
+
+
+def test_delete_index_card_missing_card_is_204():
+    mock_table = MagicMock()
+    mock_table.delete_entity.side_effect = ResourceNotFoundError("missing")
+    with _auth_patch(), patch("daily.cards.get_table_client", return_value=mock_table):
+        resp = function_app.delete_index_card(
+            _req("DELETE", "/api/daily/cards/missing", route_params={"card_id": "missing"})
+        )
+    assert resp.status_code == 204
 
 
 def test_review_index_card_rejects_bad_grade():

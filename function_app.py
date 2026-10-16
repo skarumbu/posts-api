@@ -693,8 +693,13 @@ def create_index_card(req: func.HttpRequest) -> func.HttpResponse:
     text = (body.get("text") or "").strip()
     if not text:
         return _json_response({"error": "text is required"}, status_code=400)
+    back = body.get("back")
+    if back is None:
+        back = ""
+    elif not isinstance(back, str):
+        return _json_response({"error": "back must be a string"}, status_code=400)
     try:
-        card = daily_cards.create_card(email, text)
+        card = daily_cards.create_card(email, text, back=back.strip())
         return _json_response(dataclasses.asdict(card), status_code=201)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
@@ -719,3 +724,19 @@ def review_index_card(req: func.HttpRequest) -> func.HttpResponse:
         return _json_response({"error": "not found"}, status_code=404)
     except Exception:
         return _json_response({"error": "storage error"}, status_code=500)
+
+
+@app.route(route="daily/cards/{card_id}", methods=["DELETE"])
+def delete_index_card(req: func.HttpRequest) -> func.HttpResponse:
+    email, err = _require_daily_auth(req)
+    if err:
+        return err
+    card_id = req.route_params.get("card_id")
+    try:
+        daily_cards.delete_card(email, card_id)
+    except Exception:
+        return _json_response({"error": "storage error"}, status_code=500)
+    return func.HttpResponse(
+        status_code=204,
+        headers={"Access-Control-Allow-Origin": ALLOWED_ORIGIN},
+    )
