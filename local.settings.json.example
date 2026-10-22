@@ -3,7 +3,6 @@
   "Values": {
     "FUNCTIONS_WORKER_RUNTIME": "python",
     "HISTORY_API_URL": "https://history-api-prod.azurewebsites.net/api",
-    "HISTORY_API_KEY": "",
-    "DAILY_STORAGE_CONNECTION_STRING": "UseDevelopmentStorage=true"
+    "HISTORY_API_KEY": ""
   }
 }
