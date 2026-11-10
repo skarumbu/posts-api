@@ -1,0 +1,60 @@
+{
+  "versions": [
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-c",
+      "created_at": "2026-01-02T10:00:00.123Z",
+      "content": "---\ntitle: T\nslug: essay\ndate: '2026-01-01'\npublished: false\nupdatedAt: '2026-01-01T00:00:00Z'\n---\na b c d e"
+    },
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-a",
+      "created_at": "2026-01-01T10:00:00.123Z",
+      "content": "---\ntitle: T\nslug: essay\ndate: '2026-01-01'\npublished: false\nupdatedAt: '2026-01-01T00:00:00Z'\n---\na b"
+    },
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-b",
+      "created_at": "2026-01-02T10:00:00.123Z",
+      "content": "---\ntitle: T\nslug: essay\ndate: '2026-01-01'\npublished: false\nupdatedAt: '2026-01-01T00:00:00Z'\n---\na b c"
+    }
+  ],
+  "expected": [
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-a",
+      "at": "2026-01-01T10:00:00.123Z",
+      "words_added": 2,
+      "words_removed": 0,
+      "total_words": 2,
+      "is_first_version": true,
+      "projector_version": 1
+    },
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-b",
+      "at": "2026-01-02T10:00:00.123Z",
+      "words_added": 1,
+      "words_removed": 0,
+      "total_words": 3,
+      "is_first_version": false,
+      "projector_version": 1
+    },
+    {
+      "section": "writing",
+      "slug": "essay",
+      "version_id": "v-c",
+      "at": "2026-01-02T10:00:00.123Z",
+      "words_added": 2,
+      "words_removed": 0,
+      "total_words": 5,
+      "is_first_version": false,
+      "projector_version": 1
+    }
+  ]
+}

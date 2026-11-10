@@ -1,0 +1,42 @@
+{
+  "versions": [
+    {
+      "section": "diary",
+      "slug": "today",
+      "version_id": "v1",
+      "created_at": "2026-01-01T10:00:00.123Z",
+      "content": "{nope"
+    },
+    {
+      "section": "diary",
+      "slug": "today",
+      "version_id": "v2",
+      "created_at": "2026-01-02T10:00:00.123Z",
+      "content": "{\"title\": \"T\", \"slug\": \"s\", \"date\": \"2026-01-01\", \"updatedAt\": \"x\", \"blocks\": [{\"type\": \"text\", \"content\": \"hi there\"}]}"
+    }
+  ],
+  "expected": [
+    {
+      "section": "diary",
+      "slug": "today",
+      "version_id": "v1",
+      "at": "2026-01-01T10:00:00.123Z",
+      "words_added": 0,
+      "words_removed": 0,
+      "total_words": 0,
+      "is_first_version": true,
+      "projector_version": 1
+    },
+    {
+      "section": "diary",
+      "slug": "today",
+      "version_id": "v2",
+      "at": "2026-01-02T10:00:00.123Z",
+      "words_added": 2,
+      "words_removed": 0,
+      "total_words": 2,
+      "is_first_version": false,
+      "projector_version": 1
+    }
+  ]
+}
